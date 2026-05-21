@@ -1361,23 +1361,42 @@ def get_pdf_page_image_bytes(pdf_document, page_num):
 def get_pptx_slide_images(pptx_bytes, slide_nums):
     """
     PPTX 바이트 데이터를 임시 저장하고 지정된 슬라이드 번호(1-indexed)들의
-    이미지를 추출하여 딕셔너리로 반환 (키: slide_num, 값: image_bytes)
+    이미지를 추출하여 딕셔너리로 반환합니다. (키: slide_num, 값: image_bytes)
+
+    Streamlit Cloud/Linux 환경에서는 Windows 전용 COM(win32com/pythoncom)을 사용할 수 없으므로
+    이미지 추출을 건너뛰고 빈 딕셔너리를 반환합니다.
     """
-    import win32com.client
-    import pythoncom
-    
-    pythoncom.CoInitialize()
+    import platform
+
     img_dict = {}
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        temp_pptx = os.path.join(tmpdir, "temp_extract.pptx")
-        with open(temp_pptx, "wb") as f:
-            f.write(pptx_bytes)
-            
-        powerpoint = win32com.client.DispatchEx("Powerpoint.Application")
-        try:
+
+    # Streamlit Cloud는 Linux 환경이므로 PowerPoint COM 자동화를 사용할 수 없습니다.
+    # 이 경우 앱이 중단되지 않도록 이미지 캐시만 비워두고 나머지 분석을 계속 진행합니다.
+    if platform.system() != "Windows":
+        print("[안내] Streamlit Cloud/Linux에서는 PPTX 슬라이드 이미지 변환을 건너뜁니다.")
+        return img_dict
+
+    try:
+        import win32com.client
+        import pythoncom
+    except ImportError as e:
+        print(f"[안내] win32com/pythoncom을 사용할 수 없어 PPTX 이미지 변환을 건너뜁니다: {e}")
+        return img_dict
+
+    powerpoint = None
+    presentation = None
+
+    try:
+        pythoncom.CoInitialize()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_pptx = os.path.join(tmpdir, "temp_extract.pptx")
+            with open(temp_pptx, "wb") as f:
+                f.write(pptx_bytes)
+
+            powerpoint = win32com.client.DispatchEx("Powerpoint.Application")
             presentation = powerpoint.Presentations.Open(temp_pptx, ReadOnly=True, WithWindow=False)
-            
+
             for s_num in slide_nums:
                 if 1 <= s_num <= presentation.Slides.Count:
                     slide = presentation.Slides(s_num)
@@ -1387,13 +1406,28 @@ def get_pptx_slide_images(pptx_bytes, slide_nums):
                     if os.path.exists(img_path):
                         with open(img_path, "rb") as f:
                             img_dict[s_num] = f.read()
-            presentation.Close()
-        except Exception as e:
-            print(f"PPTX 이미지 추출 실패: {e}")
-        finally:
-            powerpoint.Quit()
+
+    except Exception as e:
+        print(f"PPTX 이미지 추출 실패: {e}")
+
+    finally:
+        try:
+            if presentation is not None:
+                presentation.Close()
+        except Exception:
+            pass
+
+        try:
+            if powerpoint is not None:
+                powerpoint.Quit()
+        except Exception:
+            pass
+
+        try:
             pythoncom.CoUninitialize()
-            
+        except Exception:
+            pass
+
     return img_dict
 
 

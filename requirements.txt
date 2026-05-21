@@ -1,6 +1,10 @@
 streamlit
-python-pptx
 openai
 pandas
-python-dotenv
+numpy
+opencv-python-headless
+pillow
+python-pptx
 PyMuPDF
+openpyxl
+python-dotenv
