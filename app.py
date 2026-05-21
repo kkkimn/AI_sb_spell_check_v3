@@ -416,17 +416,42 @@ def render_grade_legend():
 # 메인 영역
 st.subheader("📁 1. 파일 업로드 (PPTX)")
 
+MAIN_ANALYSIS_STATE_KEYS = [
+    "corrections",
+    "locations",
+    "script_text",
+    "full_text",
+    "score_result",
+    "content_reviews",
+]
+
+if "main_file_uploader_reset_counter" not in st.session_state:
+    st.session_state.main_file_uploader_reset_counter = 0
+
+def reset_main_analysis_state():
+    for key in MAIN_ANALYSIS_STATE_KEYS:
+        st.session_state.pop(key, None)
+    st.session_state.main_file_uploader_reset_counter += 1
+    st.session_state.main_reset_done = True
+
 # 지식 기반 선택
 kb_options = ["선택 안함"] + list(knowledge_base.keys()) if 'knowledge_base' in locals() else ["선택 안함"]
 selected_kb_keyword = st.selectbox("검사에 적용할 사전 학습 지식 (선택)", options=kb_options)
 
-uploaded_file = st.file_uploader("검사할 파워포인트 파일을 올려주세요.", type=["pptx"])
+if st.session_state.pop("main_reset_done", False):
+    st.success("업로드된 문서와 분석 결과를 모두 초기화했습니다.")
+
+uploaded_file = st.file_uploader(
+    "검사할 파워포인트 파일을 올려주세요.",
+    type=["pptx"],
+    key=f"main_uploaded_file_{st.session_state.main_file_uploader_reset_counter}",
+)
 
 if uploaded_file is not None:
     st.success(f"'{uploaded_file.name}' 업로드 성공!")
     
     # 세션 상태 초기화
-    for key in ['corrections', 'script_text', 'full_text', 'score_result']:
+    for key in MAIN_ANALYSIS_STATE_KEYS:
         if key not in st.session_state:
             st.session_state[key] = None
         
@@ -542,6 +567,15 @@ if uploaded_file is not None:
                 
             progress_bar.progress(100)
             status_text.markdown("**✅ AI 분석 완료!**")
+
+    has_analysis_result = any(
+        st.session_state.get(key) is not None
+        for key in ["corrections", "score_result", "content_reviews", "script_text", "full_text"]
+    )
+    if has_analysis_result:
+        if st.button("🔄 결과 및 업로드 문서 리셋", use_container_width=True):
+            reset_main_analysis_state()
+            st.rerun()
 
     # ──────────────────────────────────────────────
     # 점수 대시보드 표시
