@@ -1354,7 +1354,7 @@ def get_pdf_page_image_bytes(pdf_document, page_num):
     """PDF에서 특정 페이지(1-indexed)의 이미지를 바이트로 추출"""
     if 1 <= page_num <= len(pdf_document):
         page = pdf_document[page_num - 1]
-        pix = page.get_pixmap(dpi=72)
+        pix = page.get_pixmap(dpi=144)
         return pix.tobytes("png")
     return None
 
@@ -1443,10 +1443,10 @@ def get_pptx_slide_images(pptx_bytes, slide_nums):
                                 page_idx = s_num - 1
                                 if 0 <= page_idx < len(pdf_doc):
                                     page = pdf_doc[page_idx]
-                                    # 기존 COM 방식과 비슷하게 가로 640px 기준 렌더링
+                                    # 엑셀 첨부 이미지가 작지 않도록 가로 1280px 기준으로 2배 크게 렌더링
                                     rect = page.rect
-                                    zoom = 640 / rect.width if rect.width else 1.0
-                                    zoom = max(0.5, min(3.0, zoom))
+                                    zoom = 1280 / rect.width if rect.width else 1.0
+                                    zoom = max(0.5, min(4.0, zoom))
                                     mat = fitz.Matrix(zoom, zoom)
                                     pix = page.get_pixmap(matrix=mat, alpha=False)
                                     img_dict[s_num] = pix.tobytes("png")
@@ -1492,7 +1492,7 @@ def get_pptx_slide_images(pptx_bytes, slide_nums):
                 if 1 <= s_num <= presentation.Slides.Count:
                     slide = presentation.Slides(s_num)
                     img_path = os.path.join(tmpdir, f"slide_{s_num}.png")
-                    slide.Export(img_path, "PNG", 640, 360)
+                    slide.Export(img_path, "PNG", 1280, 720)
                     if os.path.exists(img_path):
                         with open(img_path, "rb") as f:
                             img_dict[s_num] = f.read()
