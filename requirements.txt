@@ -8,3 +8,4 @@ openpyxl
 pillow
 python-pptx
 python-dotenv
+PyMuPDF
