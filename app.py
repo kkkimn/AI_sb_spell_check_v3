@@ -192,30 +192,100 @@ with st.sidebar:
     st.divider()
     st.subheader("📖 사용자 맞춤법 사전")
     
-    dict_file_path = "맞춤법사전.txt"
-    default_dict_text = "챗지피티\nAI교수님\n한기대"
+    sp_dict_file_path = "custom_spelling_dicts.json"
+    spelling_dicts = {}
     
-    if os.path.exists(dict_file_path):
-        with open(dict_file_path, "r", encoding="utf-8") as f:
-            default_dict_text = f.read()
-            
-    custom_dict_input = st.text_area(
-        "AI가 절대 수정하면 안 되는 예외 단어를 쉼표(,)나 줄바꿈으로 적어주세요.",
-        value=default_dict_text,
-        height=150,
-        help="여기에 적힌 단어는 맞춤법사전.txt 파일과 동기화됩니다."
+    def _save_all_spelling_dicts(dicts_to_save):
+        with open(sp_dict_file_path, "w", encoding="utf-8") as f:
+            json.dump(dicts_to_save, f, ensure_ascii=False, indent=2)
+        # 하위 호환성을 위해 모든 사전의 단어를 맞춤법사전.txt에 통합 저장
+        all_words = []
+        for words in dicts_to_save.values():
+            all_words.extend(words)
+        unique_words = sorted(list(set(all_words)))
+        with open("맞춤법사전.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(unique_words))
+
+    # 데이터 로드 및 마이그레이션
+    if os.path.exists(sp_dict_file_path):
+        with open(sp_dict_file_path, "r", encoding="utf-8") as f:
+            try:
+                spelling_dicts = json.load(f)
+            except Exception:
+                pass
+    else:
+        # 기존 맞춤법사전.txt가 있으면 가져와서 '기본 사전'으로 마이그레이션
+        old_dict_path = "맞춤법사전.txt"
+        if os.path.exists(old_dict_path):
+            try:
+                with open(old_dict_path, "r", encoding="utf-8") as f:
+                    old_text = f.read()
+                raw_words = old_text.replace('\n', ',').split(',')
+                words_list = [w.strip() for w in raw_words if w.strip()]
+                if words_list:
+                    spelling_dicts["기본 사전"] = words_list
+                    _save_all_spelling_dicts(spelling_dicts)
+            except Exception:
+                pass
+
+    new_dict_name = st.text_input("새 맞춤법 사전 이름", placeholder="예: IT 용어 사전")
+    new_dict_words = st.text_area(
+        "예외 단어 입력 (쉼표(,)나 줄바꿈으로 구분)",
+        height=100,
+        placeholder="단어1\n단어2"
     )
-    
-    if st.button("💾 사전 파일(`맞춤법사전.txt`)에 저장"):
-        with open(dict_file_path, "w", encoding="utf-8") as f:
-            f.write(custom_dict_input)
-        st.success("✔ 성공적으로 파일에 저장되었습니다!")
-    
-    # 텍스트 에어리어 입력을 리스트로 변환
-    custom_dict_list = []
-    if custom_dict_input.strip():
-        raw_words = custom_dict_input.replace('\n', ',').split(',')
-        custom_dict_list = [w.strip() for w in raw_words if w.strip()]
+
+    if st.button("➕ 맞춤법 사전 등록"):
+        target_name = new_dict_name.strip()
+        if not target_name:
+            st.error("사전 이름을 입력해주세요.")
+        else:
+            raw_w = new_dict_words.replace('\n', ',').split(',')
+            w_list = [w.strip() for w in raw_w if w.strip()]
+            spelling_dicts[target_name] = w_list
+            _save_all_spelling_dicts(spelling_dicts)
+            st.success(f"'{target_name}' 사전 등록 완료!")
+            st.rerun()
+
+    if spelling_dicts:
+        st.markdown("**등록된 맞춤법 사전 목록:**")
+        for dn in list(spelling_dicts.keys()):
+            words_str = "\n".join(spelling_dicts[dn])
+
+            if st.session_state.get(f"edit_sp_mode_{dn}", False):
+                new_dn = st.text_input("새 사전 이름", value=dn, key=f"new_dn_{dn}", label_visibility="collapsed")
+                new_words_val = st.text_area("단어 편집", value=words_str, key=f"edit_words_{dn}", height=120)
+
+                col_s1, col_s2, col_s3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
+                with col_s2:
+                    if st.button("💾", key=f"save_sp_{dn}", help="저장", type="tertiary"):
+                        raw_w = new_words_val.replace('\n', ',').split(',')
+                        w_list = [w.strip() for w in raw_w if w.strip()]
+                        if new_dn and new_dn != dn:
+                            spelling_dicts.pop(dn)
+                            spelling_dicts[new_dn] = w_list
+                        else:
+                            spelling_dicts[dn] = w_list
+                        _save_all_spelling_dicts(spelling_dicts)
+                        st.session_state[f"edit_sp_mode_{dn}"] = False
+                        st.rerun()
+                with col_s3:
+                    if st.button("❌", key=f"cancel_sp_{dn}", help="취소", type="tertiary"):
+                        st.session_state[f"edit_sp_mode_{dn}"] = False
+                        st.rerun()
+            else:
+                col1, col2, col3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
+                with col1:
+                    st.caption(f"- {dn} ({len(spelling_dicts[dn])}개 단어)")
+                with col2:
+                    if st.button("✏️", key=f"edit_sp_{dn}", help=f"'{dn}' 이름 및 단어 수정", type="tertiary"):
+                        st.session_state[f"edit_sp_mode_{dn}"] = True
+                        st.rerun()
+                with col3:
+                    if st.button("🗑️", key=f"del_sp_{dn}", help=f"'{dn}' 사전 삭제", type="tertiary"):
+                        spelling_dicts.pop(dn)
+                        _save_all_spelling_dicts(spelling_dicts)
+                        st.rerun()
 
 # ==========================================
 # 점수 대시보드 렌더링 함수
@@ -416,42 +486,25 @@ def render_grade_legend():
 # 메인 영역
 st.subheader("📁 1. 파일 업로드 (PPTX)")
 
-MAIN_ANALYSIS_STATE_KEYS = [
-    "corrections",
-    "locations",
-    "script_text",
-    "full_text",
-    "score_result",
-    "content_reviews",
-]
-
-if "main_file_uploader_reset_counter" not in st.session_state:
-    st.session_state.main_file_uploader_reset_counter = 0
-
-def reset_main_analysis_state():
-    for key in MAIN_ANALYSIS_STATE_KEYS:
-        st.session_state.pop(key, None)
-    st.session_state.main_file_uploader_reset_counter += 1
-    st.session_state.main_reset_done = True
-
 # 지식 기반 선택
 kb_options = ["선택 안함"] + list(knowledge_base.keys()) if 'knowledge_base' in locals() else ["선택 안함"]
 selected_kb_keyword = st.selectbox("검사에 적용할 사전 학습 지식 (선택)", options=kb_options)
 
-if st.session_state.pop("main_reset_done", False):
-    st.success("업로드된 문서와 분석 결과를 모두 초기화했습니다.")
+# 맞춤법 사전 선택 (다중 선택 가능 - 숨김 처리)
+# sp_options_multi = list(spelling_dicts.keys()) if 'spelling_dicts' in locals() else []
+# selected_sp_dicts = st.multiselect("검사에 적용할 사용자 맞춤법 사전 (다중 선택 가능)", options=sp_options_multi, default=sp_options_multi)
 
-uploaded_file = st.file_uploader(
-    "검사할 파워포인트 파일을 올려주세요.",
-    type=["pptx"],
-    key=f"main_uploaded_file_{st.session_state.main_file_uploader_reset_counter}",
-)
+# 맞춤법 사전 선택 (단일 선택)
+sp_options = ["선택 안함"] + list(spelling_dicts.keys()) if 'spelling_dicts' in locals() else ["선택 안함"]
+selected_sp_dict = st.selectbox("검사에 적용할 사용자 맞춤법 사전 (선택)", options=sp_options)
+
+uploaded_file = st.file_uploader("검사할 파워포인트 파일을 올려주세요.", type=["pptx"])
 
 if uploaded_file is not None:
     st.success(f"'{uploaded_file.name}' 업로드 성공!")
     
     # 세션 상태 초기화
-    for key in MAIN_ANALYSIS_STATE_KEYS:
+    for key in ['corrections', 'script_text', 'full_text', 'score_result']:
         if key not in st.session_state:
             st.session_state[key] = None
         
@@ -497,6 +550,17 @@ if uploaded_file is not None:
                 progress = int((current / total) * 100)
                 progress_bar.progress(progress)
                 status_text.markdown(f"**진행 상황 (맞춤법 스캔):** {current}/{total} 페이지/슬라이드 스캔 완료... ({selected_model} 사용 중)")
+            
+            # 선택된 맞춤법 사전들로부터 단어 취합 (다중 선택 - 숨김 처리)
+            # custom_dict_list = []
+            # if 'selected_sp_dicts' in locals() and selected_sp_dicts:
+            #     for dn in selected_sp_dicts:
+            #         custom_dict_list.extend(spelling_dicts.get(dn, []))
+            
+            # 선택된 맞춤법 사전으로부터 단어 취합 (단일 선택)
+            custom_dict_list = []
+            if 'selected_sp_dict' in locals() and selected_sp_dict != "선택 안함":
+                custom_dict_list.extend(spelling_dicts.get(selected_sp_dict, []))
             
             # 선택된 지식 베이스가 있다면 용어 목록을 맞춤법 예외 사전에 병합
             active_kb_data = None
@@ -567,15 +631,6 @@ if uploaded_file is not None:
                 
             progress_bar.progress(100)
             status_text.markdown("**✅ AI 분석 완료!**")
-
-    has_analysis_result = any(
-        st.session_state.get(key) is not None
-        for key in ["corrections", "score_result", "content_reviews", "script_text", "full_text"]
-    )
-    if has_analysis_result:
-        if st.button("🔄 결과 및 업로드 문서 리셋", use_container_width=True):
-            reset_main_analysis_state()
-            st.rerun()
 
     # ──────────────────────────────────────────────
     # 점수 대시보드 표시
@@ -758,9 +813,9 @@ if uploaded_file is not None:
             )
             
             if is_pdf:
-                st.warning("위 변경 사항들은 완성본 다운로드 시 '파란색 형광펜 (메모 코멘트)' 형태로 PDF에 표시됩니다.")
+                st.warning("위 변경 사항들은 완성본 다운로드 시 '핑크색(FF00E5) 형광펜 (메모 코멘트)' 형태로 PDF에 표시됩니다.")
             else:
-                st.warning("위 변경 사항들은 완성본 다운로드 시 '파란색' 서식으로 PPT에 일괄 덮어씌워집니다. "
+                st.warning("위 변경 사항들은 완성본 다운로드 시 '핑크색(FF00E5)' 서식으로 PPT에 일괄 덮어씌워집니다. "
                            "(부분 굵게/색상 등 일부 인라인 서식은 초기화될 수 있습니다.)")
             
         st.subheader("📥 3. 완성본 다운로드")
@@ -772,13 +827,13 @@ if uploaded_file is not None:
                 doc_obj.save(out_stream)
                 doc_obj.close()
                 mime_type = "application/pdf"
-                btn_label = "💙 교정 하이라이트 PDF 다운로드"
+                btn_label = "💖 교정 하이라이트 PDF 다운로드"
                 file_ext = "pdf"
             else:
                 core.apply_corrections_to_ppt(doc_obj, st.session_state.corrections)
                 doc_obj.save(out_stream)
                 mime_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                btn_label = "💙 파란색 교정 반영본 PPTX 다운로드"
+                btn_label = "💖 핑크색 교정 반영본 PPTX 다운로드"
                 file_ext = "pptx"
                 
             out_stream.seek(0)
@@ -790,20 +845,4 @@ if uploaded_file is not None:
             mime=mime_type,
             use_container_width=True
         )
-            
-        st.subheader("📝 4. 한기대 대본 추출")
-        st.markdown("대본 추출은 별도 도구에서 진행합니다. 아래 버튼을 누르면 새 탭에서 추출기가 열립니다.")
-        
-        html_source = "대본_추출기_통합.html"
-        
-        if not os.path.exists(html_source):
-            st.error(f"'{html_source}' 파일을 찾을 수 없습니다. app.py와 같은 폴더에 두세요.")
-        else:
-            with st.expander("🎙️ 대본 추출기 엽니다 (클릭하여 열기/접기)", expanded=True):
-                with open(html_source, "r", encoding="utf-8") as f:
-                    html_content = f.read()
-                
-                # HTML 파일 내용을 현재 화면(iframe)에 직접 렌더링
-                st.components.v1.html(html_content, height=800, scrolling=True)
-            
-            st.caption("💡 위 추출기를 통해 결과물 PPTX 파일을 올려주시면 성우 대본/프롬프트 대본을 뽑을 수 있습니다.")
+
