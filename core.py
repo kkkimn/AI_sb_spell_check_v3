@@ -9,6 +9,23 @@ from openai import OpenAI
 import fitz  # PyMuPDF
 
 
+def _clean_xml_compatible_string(s):
+    """
+    XML에 유효하지 않은 제어 문자들을 제거하거나 변환합니다.
+    \x0b(Vertical Tab)과 \x0c(Form Feed)는 줄바꿈(\n)으로 변환하고,
+    기타 XML 1.0 규격에 어긋나는 제어 문자들은 공백 없이 제거합니다.
+    """
+    if not isinstance(s, str):
+        return s
+    s = s.replace('\x0b', '\n').replace('\x0c', '\n')
+    return "".join(
+        c for c in s
+        if (0x20 <= ord(c) <= 0xD7FF) or
+           c in '\t\n\r' or
+           (0xE000 <= ord(c) <= 0xFFFD) or
+           (0x10000 <= ord(c) <= 0x10FFFF)
+    )
+
 # ==========================================
 # 공통 헬퍼: 그룹 도형 재귀 순회
 # ==========================================
@@ -1021,7 +1038,7 @@ def _apply_to_paragraph(paragraph, corrections_dict):
             continue
             
         new_run = paragraph.add_run()
-        new_run.text = chunk_text
+        new_run.text = _clean_xml_compatible_string(chunk_text)
         
         if font_ref:
             for attr in ['name', 'size', 'bold', 'italic', 'underline']:
@@ -1640,5 +1657,593 @@ def generate_knowledge_from_text(text, api_key, model="gpt-4o"):
     except Exception as e:
         print(f"문서 기반 지식 생성 실패: {e}")
         return None
+
+
+# ==========================================
+# [한글 HWP 전용 기능] olefile & zlib 활용
+# ==========================================
+
+def extract_text_hwp(hwp_file):
+    """
+    HWP5 파일의 OLE 구조에서 BodyText 섹션들을 찾아 텍스트를 추출합니다.
+    """
+    import olefile
+    import zlib
+    import io
+
+    if isinstance(hwp_file, bytes):
+        hwp_file = io.BytesIO(hwp_file)
+
+    try:
+        ole = olefile.OleFileIO(hwp_file)
+    except Exception as e:
+        print(f"HWP OLE 열기 오류: {e}")
+        return ""
+
+    dirs = ole.listdir()
+    
+    sections = []
+    for d in dirs:
+        if d[0] == "BodyText":
+            sections.append(d)
+            
+    sections.sort() # Section0, Section1, ...
+    
+    text_parts = []
+    
+    for section in sections:
+        try:
+            stream = ole.openstream(section)
+            data = stream.read()
+            
+            # HWP5 스트림은 대개 zlib (raw deflate) 압축되어 있습니다.
+            try:
+                decompressed = zlib.decompress(data, -15)
+            except Exception:
+                decompressed = data
+                
+            # HWPTAG_PARA_TEXT(67) 레코드에서 UTF-16LE 텍스트 추출
+            i = 0
+            n = len(decompressed)
+            while i < n:
+                if i + 4 > n:
+                    break
+                header = int.from_bytes(decompressed[i:i+4], byteorder='little')
+                tag_id = header & 0x3FF
+                level = (header >> 10) & 0x3FF
+                size = (header >> 20) & 0xFFF
+                i += 4
+                
+                if size == 0xFFF:
+                    if i + 4 > n:
+                        break
+                    size = int.from_bytes(decompressed[i:i+4], byteorder='little')
+                    i += 4
+                    
+                if i + size > n:
+                    break
+                    
+                record_data = decompressed[i:i+size]
+                i += size
+                
+                if tag_id == 67: # HWPTAG_PARA_TEXT
+                    para_text = []
+                    j = 0
+                    while j < len(record_data):
+                        char_code = int.from_bytes(record_data[j:j+2], byteorder='little')
+                        if char_code == 0:
+                            break
+                        if char_code < 32:
+                            # 제어 문자 필터링
+                            if char_code in (9, 10, 13):
+                                para_text.append(chr(char_code))
+                                j += 2
+                            elif char_code in (1, 2, 3, 24, 25, 26, 28, 29, 30, 31):
+                                j += 2
+                            elif char_code in (4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23):
+                                # 확장 제어 문자는 16바이트를 차지함
+                                j += 16
+                            else:
+                                j += 2
+                        else:
+                            para_text.append(chr(char_code))
+                            j += 2
+                    text_parts.append("".join(para_text))
+        except Exception as e:
+            print(f"HWP 섹션 {section} 파싱 오류: {e}")
+            
+    ole.close()
+    return "\n".join(text_parts)
+
+
+def get_openai_corrections_hwp_text(full_text, api_key, is_paid_tier=True, custom_dict=None, progress_callback=None, model="gpt-4o"):
+    """
+    HWP에서 추출된 텍스트를 청크 단위로 나누어 OpenAI 교정을 실행합니다.
+    """
+    client = OpenAI(api_key=api_key)
+    global_corrections = {}
+    locations = {}
+    
+    # 문장이나 줄 바꿈 기준으로 나눔
+    lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+    
+    chunk_size = 15
+    chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+    total_chunks = len(chunks)
+    
+    system_prompt = _build_system_prompt(custom_dict, doc_kind="한글 문서")
+    
+    for idx, chunk in enumerate(chunks):
+        chunk_text = "\n".join(chunk)
+        if not chunk_text.strip():
+            if progress_callback: progress_callback(idx + 1, total_chunks)
+            continue
+            
+        user_prompt = f'=== 한글 문서 파트 {idx+1} 텍스트 ===\n{chunk_text}'
+        
+        success = False
+        for attempt in range(5):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1
+                )
+                res_text = response.choices[0].message.content.strip()
+                chunk_dict = json.loads(res_text)
+                
+                for k, v in chunk_dict.items():
+                    k_str = str(k).strip()
+                    v_str = str(v).strip()
+                    if not k_str or not v_str: continue
+                    if k_str == v_str: continue
+                    if len(k_str) == 1 and k_str in {" ", ".", ",", "!", "?", "-", "_", "·", "/"}: continue
+                    
+                    if _is_custom_dict_violation(k_str, v_str, custom_dict):
+                        continue
+                        
+                    if k_str not in global_corrections:
+                        global_corrections[k_str] = v_str
+                    if k_str not in locations:
+                        locations[k_str] = []
+                    loc_name = f"파트 {idx+1}"
+                    if loc_name not in locations[k_str]:
+                        locations[k_str].append(loc_name)
+                        
+                success = True
+                break
+            except Exception as e:
+                time.sleep(2)
+                
+        if progress_callback:
+            progress_callback(idx + 1, total_chunks)
+            
+    return global_corrections, locations
+
+
+def apply_corrections_to_text(text, corrections_dict):
+    """
+    일반 텍스트 문자열에 교정 사항을 일괄 치환하여 반환합니다.
+    """
+    lines = text.split('\n')
+    corrected_lines = []
+    
+    # 긴 키부터 치환
+    sorted_corrections = sorted(corrections_dict.items(), key=lambda x: -len(x[0]))
+    
+    for line in lines:
+        corrected_line = line
+        is_changed = False
+        for old_txt, new_txt in sorted_corrections:
+            if old_txt in corrected_line:
+                corrected_line = corrected_line.replace(old_txt, new_txt)
+                is_changed = True
+        if is_changed:
+            corrected_line = re.sub(r' {2,}', ' ', corrected_line)
+            corrected_line = _clean_punctuation(corrected_line)
+        corrected_lines.append(corrected_line)
+        
+    return "\n".join(corrected_lines)
+
+
+# ==========================================
+# [워드 DOCX 전용 기능] python-docx 활용
+# ==========================================
+
+def extract_full_text_docx(doc):
+    """Word 문서 전체 텍스트 추출 (어절 수 산출용)."""
+    parts = []
+    for paragraph in doc.paragraphs:
+        t = paragraph.text.strip()
+        if t: parts.append(t)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    t = paragraph.text.strip()
+                    if t: parts.append(t)
+    return ' '.join(parts)
+
+
+def get_openai_corrections_docx(doc, api_key, is_paid_tier=True, custom_dict=None, progress_callback=None, model="gpt-4o"):
+    """
+    DOCX 문서를 문단 단위 혹은 청크 단위로 나누어 OpenAI 교정을 실행합니다.
+    """
+    client = OpenAI(api_key=api_key)
+    global_corrections = {}
+    locations = {}
+    
+    # 문단 및 표 셀의 텍스트 수집
+    texts = []
+    for paragraph in doc.paragraphs:
+        t = paragraph.text.strip()
+        if t: texts.append(t)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    t = paragraph.text.strip()
+                    if t: texts.append(t)
+                    
+    # 약 10문단씩 청크로 묶어서 스캔
+    chunk_size = 10
+    chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+    total_chunks = len(chunks)
+    
+    system_prompt = _build_system_prompt(custom_dict, doc_kind="워드 문서")
+    
+    for idx, chunk in enumerate(chunks):
+        full_text = "\n".join(chunk)
+        if not full_text.strip():
+            if progress_callback: progress_callback(idx + 1, total_chunks)
+            continue
+            
+        user_prompt = f'=== 워드 파트 {idx+1} 텍스트 ===\n{full_text}'
+        
+        success = False
+        for attempt in range(5):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1
+                )
+                res_text = response.choices[0].message.content.strip()
+                chunk_dict = json.loads(res_text)
+                
+                for k, v in chunk_dict.items():
+                    k_str = str(k).strip()
+                    v_str = str(v).strip()
+                    if not k_str or not v_str: continue
+                    if k_str == v_str: continue
+                    if len(k_str) == 1 and k_str in {" ", ".", ",", "!", "?", "-", "_", "·", "/"}: continue
+                    
+                    if _is_custom_dict_violation(k_str, v_str, custom_dict):
+                        continue
+                        
+                    if k_str not in global_corrections:
+                        global_corrections[k_str] = v_str
+                    if k_str not in locations:
+                        locations[k_str] = []
+                    loc_name = f"파트 {idx+1}"
+                    if loc_name not in locations[k_str]:
+                        locations[k_str].append(loc_name)
+                        
+                success = True
+                break
+            except Exception as e:
+                time.sleep(2)
+                
+        if progress_callback:
+            progress_callback(idx + 1, total_chunks)
+            
+    return global_corrections, locations
+
+
+def apply_corrections_to_docx(doc, corrections_dict):
+    """
+    Word (DOCX) 파일의 단락과 표 셀의 텍스트에 교정을 적용하고 핑크색(#FF00E5)으로 변경한다.
+    """
+    from docx.shared import RGBColor as DocxRGBColor
+    
+    # 1. 단락 처리
+    for paragraph in doc.paragraphs:
+        _apply_to_docx_paragraph(paragraph, corrections_dict, DocxRGBColor)
+        
+    # 2. 표 처리
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    _apply_to_docx_paragraph(paragraph, corrections_dict, DocxRGBColor)
+
+
+def _apply_to_docx_paragraph(paragraph, corrections_dict, DocxRGBColor):
+    original_text = paragraph.text.strip()
+    if not original_text:
+        return
+        
+    corrected_text = original_text
+    is_changed = False
+    
+    # 긴 키부터 치환
+    for old_txt, new_txt in sorted(corrections_dict.items(), key=lambda x: -len(x[0])):
+        if old_txt in corrected_text:
+            corrected_text = corrected_text.replace(old_txt, new_txt)
+            is_changed = True
+            
+    # 다중 공백 및 구두점 정리
+    spaced_fixed = re.sub(r' {2,}', ' ', corrected_text)
+    if spaced_fixed != corrected_text:
+        corrected_text = spaced_fixed
+        is_changed = True
+    cleaned = _clean_punctuation(corrected_text)
+    if cleaned != corrected_text:
+        corrected_text = cleaned
+        is_changed = True
+        
+    if not is_changed:
+        return
+        
+    if paragraph.runs:
+        font_ref = paragraph.runs[0].font
+    else:
+        font_ref = None
+        
+    # 기존 runs의 텍스트와 서식을 기반으로 새 runs 생성
+    paragraph.text = "" # 단락 비우기
+    
+    tokens_orig = re.split(r'(\s+)', original_text)
+    tokens_corr = re.split(r'(\s+)', corrected_text)
+    
+    matcher = difflib.SequenceMatcher(None, tokens_orig, tokens_corr)
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'delete':
+            continue
+            
+        chunk_text = "".join(tokens_corr[j1:j2])
+        if not chunk_text:
+            continue
+            
+        new_run = paragraph.add_run(_clean_xml_compatible_string(chunk_text))
+        
+        # 폰트 스타일 상속
+        if font_ref:
+            try:
+                new_run.font.name = font_ref.name
+                new_run.font.size = font_ref.size
+                new_run.font.bold = font_ref.bold
+                new_run.font.italic = font_ref.italic
+                new_run.font.underline = font_ref.underline
+            except Exception:
+                pass
+                
+        # 교정된 단어는 핫핑크색(FF00E5) 적용
+        if tag in ('replace', 'insert'):
+            new_run.font.color.rgb = DocxRGBColor(255, 0, 229)
+        else:
+            if font_ref and font_ref.color and font_ref.color.rgb:
+                try: new_run.font.color.rgb = font_ref.color.rgb
+                except Exception: pass
+
+
+def extract_text_hwpx(hwpx_file):
+    """
+    HWPX 파일은 XML 기반의 ZIP 아카이브입니다.
+    Contents/section0.xml, Contents/section1.xml 등에서 텍스트를 추출합니다.
+    """
+    import zipfile
+    import io
+    import xml.etree.ElementTree as ET
+    
+    if isinstance(hwpx_file, bytes):
+        hwpx_file = io.BytesIO(hwpx_file)
+        
+    text_parts = []
+    
+    try:
+        with zipfile.ZipFile(hwpx_file) as z:
+            # Contents/ 디렉토리 안의 section*.xml 파일들을 검색
+            section_files = [
+                name for name in z.namelist()
+                if name.startswith("Contents/section") and name.endswith(".xml")
+            ]
+            # section0.xml, section1.xml 순서대로 정렬
+            section_files.sort()
+            
+            for file_name in section_files:
+                try:
+                    xml_data = z.read(file_name)
+                    # XML 파싱
+                    root = ET.fromstring(xml_data)
+                    for elem in root.iter():
+                        if elem.tag.endswith('}t') and elem.text:
+                            text_parts.append(elem.text)
+                except Exception as e:
+                    print(f"HWPX 섹션 {file_name} 파싱 오류: {e}")
+    except Exception as e:
+        print(f"HWPX ZIP 열기 오류: {e}")
+        return ""
+        
+    return "\n".join(text_parts)
+
+
+def apply_corrections_to_hwpx(hwpx_bytes, corrections_dict):
+    """
+    HWPX 파일 내부 XML 파일의 텍스트 노드(<hp:t>)들에 교정 사항을 일괄 적용하여
+    교정이 완료된 hwpx 바이너리(bytes) 데이터를 반환합니다.
+    """
+    import zipfile
+    import io
+    import re
+    
+    in_zip = io.BytesIO(hwpx_bytes)
+    out_zip = io.BytesIO()
+    
+    sorted_corrections = sorted(corrections_dict.items(), key=lambda x: -len(x[0]))
+    
+    with zipfile.ZipFile(in_zip, "r") as zin:
+        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                
+                # section XML 내부 텍스트만 치환
+                if item.filename.startswith("Contents/section") and item.filename.endswith(".xml"):
+                    xml_content = data.decode("utf-8", errors="ignore")
+                    
+                    def repl_func(match):
+                        start_tag = match.group(1)
+                        text = match.group(2)
+                        end_tag = match.group(3)
+                        
+                        corrected_text = text
+                        is_changed = False
+                        for old_txt, new_txt in sorted_corrections:
+                            if old_txt in corrected_text:
+                                corrected_text = corrected_text.replace(old_txt, new_txt)
+                                is_changed = True
+                        if is_changed:
+                            corrected_text = re.sub(r' {2,}', ' ', corrected_text)
+                            corrected_text = _clean_punctuation(corrected_text)
+                        return f"{start_tag}{corrected_text}{end_tag}"
+                    
+                    # HWPX의 텍스트 태그 <hp:t> 혹은 <t> 매칭
+                    xml_content = re.sub(r'(<(?:hp:)?t[^>]*>)([^<]*)(</(?:hp:)?t>)', repl_func, xml_content)
+                    data = xml_content.encode("utf-8")
+                    
+                zout.writestr(item, data)
+                
+    out_zip.seek(0)
+    return out_zip.getvalue()
+
+
+def apply_corrections_to_hwp_com(hwp_bytes, corrections_dict, is_hwpx=False):
+    """
+    Windows COM (HwpObject)을 사용하여 HWP/HWPX 파일의 본문 내용을 수정하고
+    수정된 파일의 바이너리 데이터를 반환합니다. (로컬 환경 한컴오피스 의존)
+    """
+    import os
+    import tempfile
+    import win32com.client
+    import pythoncom
+    
+    pythoncom.CoInitialize()
+    
+    suffix = ".hwpx" if is_hwpx else ".hwp"
+    fd, temp_path = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, 'wb') as tmp:
+            tmp.write(hwp_bytes)
+            
+        hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+        try:
+            hwp.XHwpWindows.Item(0).Visible = False
+        except Exception:
+            pass
+            
+        try:
+            hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModule")
+        except Exception:
+            pass
+            
+        opened = hwp.Open(temp_path, "", "")
+        if not opened:
+            raise Exception("한글 COM 객체가 파일을 여는 데 실패했습니다.")
+            
+        sorted_corrections = sorted(corrections_dict.items(), key=lambda x: -len(x[0]))
+        
+        for old_txt, new_txt in sorted_corrections:
+            hwp.HAction.GetDefault("AllReplace", hwp.HParameterSet.HFindReplace.HSet)
+            hwp.HParameterSet.HFindReplace.FindString = old_txt
+            hwp.HParameterSet.HFindReplace.ReplaceString = new_txt
+            hwp.HParameterSet.HFindReplace.IgnoreMessage = 1
+            hwp.HParameterSet.HFindReplace.MatchCase = 0
+            hwp.HParameterSet.HFindReplace.AllReplace = 1
+            hwp.HAction.Execute("AllReplace", hwp.HParameterSet.HFindReplace.HSet)
+            
+        hwp.Save()
+        hwp.Quit()
+        
+        with open(temp_path, 'rb') as f:
+            corrected_bytes = f.read()
+            
+        return corrected_bytes
+        
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+        pythoncom.CoUninitialize()
+
+
+def create_docx_from_hwp_text(full_text, corrections_dict):
+    """
+    한글 본문 텍스트와 교정 딕셔너리를 바탕으로 새 Word(.docx) 문서를 생성합니다.
+    교정된 단어들은 핫핑크색(RGB 255, 0, 229)으로 하이라이트됩니다.
+    """
+    import docx
+    from docx.shared import RGBColor
+    import re
+    import difflib
+    
+    doc = docx.Document()
+    
+    # 텍스트를 줄바꿈 단위로 문단 분리
+    lines = full_text.split('\n')
+    
+    # 교정 딕셔너리를 키 글자 수 내림차순 정렬 (긴 것 우선 치환 방지용)
+    sorted_corrections = sorted(corrections_dict.items(), key=lambda x: -len(x[0]))
+    
+    for line in lines:
+        cleaned_line = line.strip()
+        if not cleaned_line:
+            doc.add_paragraph("")  # 빈 줄 추가
+            continue
+            
+        corrected_line = line
+        is_changed = False
+        
+        # 교정 텍스트 반영 여부 및 최종 교정문 확보
+        for old_txt, new_txt in sorted_corrections:
+            if old_txt in corrected_line:
+                corrected_line = corrected_line.replace(old_txt, new_txt)
+                is_changed = True
+                
+        if is_changed:
+            corrected_line = re.sub(r' {2,}', ' ', corrected_line)
+            corrected_line = _clean_punctuation(corrected_line)
+            
+        paragraph = doc.add_paragraph()
+        
+        if is_changed:
+            # 단어(공백 포함) 단위로 쪼개어 변경 부분 분석
+            tokens_orig = re.split(r'(\s+)', line)
+            tokens_corr = re.split(r'(\s+)', corrected_line)
+            
+            matcher = difflib.SequenceMatcher(None, tokens_orig, tokens_corr)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == 'delete':
+                    continue
+                chunk_text = "".join(tokens_corr[j1:j2])
+                if not chunk_text:
+                    continue
+                run = paragraph.add_run(_clean_xml_compatible_string(chunk_text))
+                if tag in ('replace', 'insert'):
+                    run.font.color.rgb = RGBColor(255, 0, 229)  # 핫핑크색
+        else:
+            paragraph.add_run(_clean_xml_compatible_string(line))
+            
+    return doc
+
 
 

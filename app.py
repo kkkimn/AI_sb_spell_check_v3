@@ -22,6 +22,24 @@ if not API_KEY_DEFAULT:
 
 st.set_page_config(page_title="AI 품질관리 시스템(원고, 스토리보드 검토)", page_icon="✨", layout="wide")
 
+# 상단 여백 최소화
+st.markdown(
+    """
+    <style>
+    .block-container,
+    .stMainBlockContainer,
+    [data-testid="stAppViewBlockContainer"] {
+        padding-top: 2rem !important;
+        padding-bottom: 2rem !important;
+    }
+    [data-testid="stHeader"] {
+        height: 2.5rem !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 st.title("✨AI 품질관리 시스템(원고, 스토리보드 검토)")
 st.markdown("압도적 성능의 **OpenAI (GPT-5.4)** AI를 사용하여 PPT 문맥을 파악하고 맞춤법을 전수 검사합니다.")
 
@@ -157,37 +175,37 @@ with st.sidebar:
                         st.error("지식 생성에 실패했습니다.")
     
     if knowledge_base:
-        st.markdown("**현재 학습된 지식 목록:**")
-        for kw in list(knowledge_base.keys()):
-            if st.session_state.get(f"edit_mode_{kw}", False):
-                new_name = st.text_input("새 이름", value=kw, key=f"new_name_{kw}", label_visibility="collapsed")
-                col_s1, col_s2, col_s3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
-                with col_s2:
-                    if st.button("💾", key=f"save_{kw}", help="저장", type="tertiary"):
-                        if new_name and new_name != kw:
-                            knowledge_base[new_name] = knowledge_base.pop(kw)
+        with st.expander("📚 현재 학습된 지식 목록 보기", expanded=False):
+            for kw in list(knowledge_base.keys()):
+                if st.session_state.get(f"edit_mode_{kw}", False):
+                    new_name = st.text_input("새 이름", value=kw, key=f"new_name_{kw}", label_visibility="collapsed")
+                    col_s1, col_s2, col_s3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
+                    with col_s2:
+                        if st.button("💾", key=f"save_{kw}", help="저장", type="tertiary"):
+                            if new_name and new_name != kw:
+                                knowledge_base[new_name] = knowledge_base.pop(kw)
+                                with open(kb_file_path, "w", encoding="utf-8") as f:
+                                    json.dump(knowledge_base, f, ensure_ascii=False, indent=2)
+                            st.session_state[f"edit_mode_{kw}"] = False
+                            st.rerun()
+                    with col_s3:
+                        if st.button("❌", key=f"cancel_{kw}", help="취소", type="tertiary"):
+                            st.session_state[f"edit_mode_{kw}"] = False
+                            st.rerun()
+                else:
+                    col1, col2, col3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
+                    with col1:
+                        st.caption(f"- {kw} ({len(knowledge_base[kw].get('terms', []))}개 용어)")
+                    with col2:
+                        if st.button("✏️", key=f"edit_{kw}", help=f"'{kw}' 이름 수정", type="tertiary"):
+                            st.session_state[f"edit_mode_{kw}"] = True
+                            st.rerun()
+                    with col3:
+                        if st.button("🗑️", key=f"del_{kw}", help=f"'{kw}' 지식 삭제", type="tertiary"):
+                            del knowledge_base[kw]
                             with open(kb_file_path, "w", encoding="utf-8") as f:
                                 json.dump(knowledge_base, f, ensure_ascii=False, indent=2)
-                        st.session_state[f"edit_mode_{kw}"] = False
-                        st.rerun()
-                with col_s3:
-                    if st.button("❌", key=f"cancel_{kw}", help="취소", type="tertiary"):
-                        st.session_state[f"edit_mode_{kw}"] = False
-                        st.rerun()
-            else:
-                col1, col2, col3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
-                with col1:
-                    st.caption(f"- {kw} ({len(knowledge_base[kw].get('terms', []))}개 용어)")
-                with col2:
-                    if st.button("✏️", key=f"edit_{kw}", help=f"'{kw}' 이름 수정", type="tertiary"):
-                        st.session_state[f"edit_mode_{kw}"] = True
-                        st.rerun()
-                with col3:
-                    if st.button("🗑️", key=f"del_{kw}", help=f"'{kw}' 지식 삭제", type="tertiary"):
-                        del knowledge_base[kw]
-                        with open(kb_file_path, "w", encoding="utf-8") as f:
-                            json.dump(knowledge_base, f, ensure_ascii=False, indent=2)
-                        st.rerun()
+                            st.rerun()
 
     st.divider()
     st.subheader("📖 사용자 맞춤법 사전")
@@ -248,44 +266,44 @@ with st.sidebar:
             st.rerun()
 
     if spelling_dicts:
-        st.markdown("**등록된 맞춤법 사전 목록:**")
-        for dn in list(spelling_dicts.keys()):
-            words_str = "\n".join(spelling_dicts[dn])
+        with st.expander("📖 등록된 맞춤법 사전 목록 보기", expanded=False):
+            for dn in list(spelling_dicts.keys()):
+                words_str = "\n".join(spelling_dicts[dn])
 
-            if st.session_state.get(f"edit_sp_mode_{dn}", False):
-                new_dn = st.text_input("새 사전 이름", value=dn, key=f"new_dn_{dn}", label_visibility="collapsed")
-                new_words_val = st.text_area("단어 편집", value=words_str, key=f"edit_words_{dn}", height=120)
+                if st.session_state.get(f"edit_sp_mode_{dn}", False):
+                    new_dn = st.text_input("새 사전 이름", value=dn, key=f"new_dn_{dn}", label_visibility="collapsed")
+                    new_words_val = st.text_area("단어 편집", value=words_str, key=f"edit_words_{dn}", height=120)
 
-                col_s1, col_s2, col_s3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
-                with col_s2:
-                    if st.button("💾", key=f"save_sp_{dn}", help="저장", type="tertiary"):
-                        raw_w = new_words_val.replace('\n', ',').split(',')
-                        w_list = [w.strip() for w in raw_w if w.strip()]
-                        if new_dn and new_dn != dn:
+                    col_s1, col_s2, col_s3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
+                    with col_s2:
+                        if st.button("💾", key=f"save_sp_{dn}", help="저장", type="tertiary"):
+                            raw_w = new_words_val.replace('\n', ',').split(',')
+                            w_list = [w.strip() for w in raw_w if w.strip()]
+                            if new_dn and new_dn != dn:
+                                spelling_dicts.pop(dn)
+                                spelling_dicts[new_dn] = w_list
+                            else:
+                                spelling_dicts[dn] = w_list
+                            _save_all_spelling_dicts(spelling_dicts)
+                            st.session_state[f"edit_sp_mode_{dn}"] = False
+                            st.rerun()
+                    with col_s3:
+                        if st.button("❌", key=f"cancel_sp_{dn}", help="취소", type="tertiary"):
+                            st.session_state[f"edit_sp_mode_{dn}"] = False
+                            st.rerun()
+                else:
+                    col1, col2, col3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
+                    with col1:
+                        st.caption(f"- {dn} ({len(spelling_dicts[dn])}개 단어)")
+                    with col2:
+                        if st.button("✏️", key=f"edit_sp_{dn}", help=f"'{dn}' 이름 및 단어 수정", type="tertiary"):
+                            st.session_state[f"edit_sp_mode_{dn}"] = True
+                            st.rerun()
+                    with col3:
+                        if st.button("🗑️", key=f"del_sp_{dn}", help=f"'{dn}' 사전 삭제", type="tertiary"):
                             spelling_dicts.pop(dn)
-                            spelling_dicts[new_dn] = w_list
-                        else:
-                            spelling_dicts[dn] = w_list
-                        _save_all_spelling_dicts(spelling_dicts)
-                        st.session_state[f"edit_sp_mode_{dn}"] = False
-                        st.rerun()
-                with col_s3:
-                    if st.button("❌", key=f"cancel_sp_{dn}", help="취소", type="tertiary"):
-                        st.session_state[f"edit_sp_mode_{dn}"] = False
-                        st.rerun()
-            else:
-                col1, col2, col3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
-                with col1:
-                    st.caption(f"- {dn} ({len(spelling_dicts[dn])}개 단어)")
-                with col2:
-                    if st.button("✏️", key=f"edit_sp_{dn}", help=f"'{dn}' 이름 및 단어 수정", type="tertiary"):
-                        st.session_state[f"edit_sp_mode_{dn}"] = True
-                        st.rerun()
-                with col3:
-                    if st.button("🗑️", key=f"del_sp_{dn}", help=f"'{dn}' 사전 삭제", type="tertiary"):
-                        spelling_dicts.pop(dn)
-                        _save_all_spelling_dicts(spelling_dicts)
-                        st.rerun()
+                            _save_all_spelling_dicts(spelling_dicts)
+                            st.rerun()
 
 # ==========================================
 # 점수 대시보드 렌더링 함수
@@ -484,21 +502,42 @@ def render_grade_legend():
 
 
 # 메인 영역
-st.subheader("📁 1. 파일 업로드 (PPTX)")
+st.markdown(
+    """
+    <div style='background-color: rgba(128, 128, 128, 0.08); padding: 15px; border-radius: 10px; border-left: 5px solid #FF00E5; margin-bottom: 20px; color: inherit;'>
+        <h4 style='margin-top: 0; color: #FF00E5;'>💡 파일 업로드 가이드</h4>
+        <ul style='margin-bottom: 0; padding-left: 20px; font-size: 15px; line-height: 1.6;'>
+            <li>한글 파일 : DOCX 파일로 변화 하여 업로드하는 것을 추천(한글 파일 업로드 시 DOCX 파일로 변환되어 추출되나 표 등 깨짐 현상 있음)</li>
+            <li>PDF 파일 : PDF로 추출되나 수정은 안되고 수정해야 될 부분이 체크되서 추출됨</li>
+            <li>PPT 파일 : 교정된 형태로 PPT 추출됨</li>
+        </ul>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
-# 지식 기반 선택
-kb_options = ["선택 안함"] + list(knowledge_base.keys()) if 'knowledge_base' in locals() else ["선택 안함"]
-selected_kb_keyword = st.selectbox("검사에 적용할 사전 학습 지식 (선택)", options=kb_options)
+st.subheader("📁 1. 파일 업로드")
 
-# 맞춤법 사전 선택 (다중 선택 가능 - 숨김 처리)
-# sp_options_multi = list(spelling_dicts.keys()) if 'spelling_dicts' in locals() else []
-# selected_sp_dicts = st.multiselect("검사에 적용할 사용자 맞춤법 사전 (다중 선택 가능)", options=sp_options_multi, default=sp_options_multi)
+# 지식 및 사전 선택 (가로 배치)
+col_kb, col_sp = st.columns(2)
+with col_kb:
+    kb_options = ["선택 안함"] + list(knowledge_base.keys()) if 'knowledge_base' in locals() else ["선택 안함"]
+    selected_kb_keyword = st.selectbox("검사에 적용할 사전 학습 지식 (선택)", options=kb_options)
 
-# 맞춤법 사전 선택 (단일 선택)
-sp_options = ["선택 안함"] + list(spelling_dicts.keys()) if 'spelling_dicts' in locals() else ["선택 안함"]
-selected_sp_dict = st.selectbox("검사에 적용할 사용자 맞춤법 사전 (선택)", options=sp_options)
+with col_sp:
+    # 맞춤법 사전 선택 (단일 선택)
+    sp_options = ["선택 안함"] + list(spelling_dicts.keys()) if 'spelling_dicts' in locals() else ["선택 안함"]
+    selected_sp_dict = st.selectbox("검사에 적용할 사용자 맞춤법 사전 (선택)", options=sp_options)
 
-uploaded_file = st.file_uploader("검사할 파워포인트 파일을 올려주세요.", type=["pptx"])
+
+if "uploader_id" not in st.session_state:
+    st.session_state.uploader_id = 0
+
+uploaded_file = st.file_uploader(
+    "검사할 문서를 올려주세요.", 
+    type=["pptx", "hwp", "hwpx", "docx", "pdf"],
+    key=f"file_uploader_{st.session_state.uploader_id}"
+)
 
 if uploaded_file is not None:
     st.success(f"'{uploaded_file.name}' 업로드 성공!")
@@ -508,15 +547,32 @@ if uploaded_file is not None:
         if key not in st.session_state:
             st.session_state[key] = None
         
-    is_pdf = uploaded_file.name.lower().endswith('.pdf')
+    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
     
     # 업로드된 파일을 메모리 기반 객체로 로드
-    if is_pdf:
+    doc_obj = None
+    hwp_text_content = ""
+    
+    # 파일 포인터를 처음으로 돌려줍니다. (BadZipFile 에러 예방)
+    uploaded_file.seek(0)
+    
+    if file_ext == '.pdf':
         import fitz
         file_bytes = uploaded_file.read()
         doc_obj = fitz.open(stream=file_bytes, filetype="pdf")
-    else:
+    elif file_ext == '.pptx':
         doc_obj = Presentation(uploaded_file)
+    elif file_ext == '.docx':
+        import docx
+        doc_obj = docx.Document(uploaded_file)
+    elif file_ext == '.hwp':
+        file_bytes = uploaded_file.read()
+        hwp_text_content = core.extract_text_hwp(file_bytes)
+        doc_obj = file_bytes
+    elif file_ext == '.hwpx':
+        file_bytes = uploaded_file.read()
+        hwp_text_content = core.extract_text_hwpx(file_bytes)
+        doc_obj = file_bytes
         
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -528,12 +584,18 @@ if uploaded_file is not None:
             st.session_state.score_result = None
             
             with st.spinner("문서를 스캔하고 대본을 추출하는 중..."):
-                if is_pdf:
+                if file_ext == '.pdf':
                     script_text = core.extract_narrations_pdf(doc_obj)
                     full_text   = core.extract_full_text_pdf(doc_obj)
-                else:
+                elif file_ext == '.pptx':
                     script_text = core.extract_narrations(doc_obj)
                     full_text   = core.extract_full_text_pptx(doc_obj)
+                elif file_ext == '.docx':
+                    script_text = {}
+                    full_text   = core.extract_full_text_docx(doc_obj)
+                elif file_ext in ('.hwp', '.hwpx'):
+                    script_text = {}
+                    full_text   = hwp_text_content
                 st.session_state.script_text = script_text
                 st.session_state.full_text   = full_text
                 
@@ -571,7 +633,7 @@ if uploaded_file is not None:
                     custom_dict_list.extend(kb_terms)
                     
             with st.spinner(f"OpenAI 맞춤법 스캔 중 (1단계) ({selected_model})..."):
-                if is_pdf:
+                if file_ext == '.pdf':
                     corrections, locations = core.get_openai_corrections_by_page_pdf(
                         doc_obj, 
                         API_KEY_DEFAULT, 
@@ -580,10 +642,28 @@ if uploaded_file is not None:
                         progress_callback=update_progress,
                         model=selected_model
                     )
-                else:
+                elif file_ext == '.pptx':
                     corrections, locations = core.get_openai_corrections_by_slide(
                         doc_obj, 
                         API_KEY_DEFAULT, 
+                        is_paid_tier=True,
+                        custom_dict=custom_dict_list,
+                        progress_callback=update_progress,
+                        model=selected_model
+                    )
+                elif file_ext == '.docx':
+                    corrections, locations = core.get_openai_corrections_docx(
+                        doc_obj,
+                        API_KEY_DEFAULT,
+                        is_paid_tier=True,
+                        custom_dict=custom_dict_list,
+                        progress_callback=update_progress,
+                        model=selected_model
+                    )
+                elif file_ext in ('.hwp', '.hwpx'):
+                    corrections, locations = core.get_openai_corrections_hwp_text(
+                        full_text,
+                        API_KEY_DEFAULT,
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
@@ -594,7 +674,7 @@ if uploaded_file is not None:
 
             # 2단계: 내용 검토 (선택된 지식이 있을 때만 수행)
             st.session_state.content_reviews = {}
-            if active_kb_data and not is_pdf:
+            if active_kb_data and file_ext == '.pptx':
                 with st.spinner(f"OpenAI 내용 검토 스캔 중 (2단계) ({selected_model})..."):
                     total_slides = len(doc_obj.slides)
                     for i, slide in enumerate(doc_obj.slides):
@@ -621,13 +701,12 @@ if uploaded_file is not None:
                         progress_bar.progress(progress)
                         status_text.markdown(f"**진행 상황 (내용 검토):** {i+1}/{total_slides} 슬라이드 스캔 완료... ({selected_model} 사용 중)")
 
-
-                # ── 점수 계산 ──────────────────────────────────
-                if st.session_state.full_text:
-                    st.session_state.score_result = core.calculate_score(
-                        corrections,
-                        st.session_state.full_text
-                    )
+            # ── 점수 계산 ──────────────────────────────────
+            if st.session_state.full_text:
+                st.session_state.score_result = core.calculate_score(
+                    corrections,
+                    st.session_state.full_text
+                )
                 
             progress_bar.progress(100)
             status_text.markdown("**✅ AI 분석 완료!**")
@@ -636,6 +715,16 @@ if uploaded_file is not None:
     # 점수 대시보드 표시
     # ──────────────────────────────────────────────
     if st.session_state.score_result is not None:
+        if st.button("🔄 검사 결과 초기화 (새 파일 올리기)", use_container_width=True):
+            st.session_state.uploader_id += 1
+            st.session_state.corrections = None
+            st.session_state.script_text = None
+            st.session_state.full_text = None
+            st.session_state.score_result = None
+            st.session_state.locations = None
+            st.session_state.content_reviews = {}
+            st.rerun()
+
         st.subheader("🏅 문서 품질 점수")
         render_score_dashboard(st.session_state.score_result)
         with st.expander("📘 등급 기준표 보기"):
@@ -659,10 +748,10 @@ if uploaded_file is not None:
                 
                 img_cache = {}
                 if unique_locs:
-                    if is_pdf:
+                    if file_ext == '.pdf':
                         for loc in unique_locs:
                             img_cache[loc] = core.get_pdf_page_image_bytes(doc_obj, loc)
-                    else:
+                    elif file_ext == '.pptx':
                         uploaded_file.seek(0)
                         pptx_bytes = uploaded_file.read()
                         img_cache = core.get_pptx_slide_images(pptx_bytes, list(unique_locs))
@@ -679,7 +768,10 @@ if uploaded_file is not None:
                 locs = loc_dict.get(old, [])
                 loc_str = ", ".join(map(str, locs))
                 if loc_str:
-                    loc_str += " 페이지" if is_pdf else " 슬라이드"
+                    if file_ext == '.pdf':
+                        loc_str += " 페이지"
+                    elif file_ext == '.pptx':
+                        loc_str += " 슬라이드"
                 
                 if loc_str and loc_str not in seen_locs:
                     img_bytes = img_cache.get(locs[0]) if locs else None
@@ -746,7 +838,7 @@ if uploaded_file is not None:
                 if len(df) > 0:
                     groups.append((start_idx, len(df) - 1, current_loc))
                     
-                img_scale = 0.17 if is_pdf else 0.32
+                img_scale = 0.17 if file_ext == '.pdf' else 0.32
                 
                 for group_idx, (s_idx, e_idx, loc_str) in enumerate(groups):
                     group_size = e_idx - s_idx + 1
@@ -812,36 +904,65 @@ if uploaded_file is not None:
                 use_container_width=True
             )
             
-            if is_pdf:
+            if file_ext == '.pdf':
                 st.warning("위 변경 사항들은 완성본 다운로드 시 '핑크색(FF00E5) 형광펜 (메모 코멘트)' 형태로 PDF에 표시됩니다.")
-            else:
+            elif file_ext == '.pptx':
                 st.warning("위 변경 사항들은 완성본 다운로드 시 '핑크색(FF00E5)' 서식으로 PPT에 일괄 덮어씌워집니다. "
                            "(부분 굵게/색상 등 일부 인라인 서식은 초기화될 수 있습니다.)")
+            elif file_ext == '.docx':
+                st.warning("위 변경 사항들은 완성본 다운로드 시 '핑크색(FF00E5)' 서식으로 워드(Word) 파일에 덮어씌워집니다.")
+            elif file_ext in ('.hwp', '.hwpx'):
+                st.warning("위 변경 사항들은 완성본 다운로드 시 교정된 내용이 반영된 워드(.docx) 문서 파일로 자동 변환되어 다운로드됩니다.")
             
         st.subheader("📥 3. 완성본 다운로드")
         
         with st.spinner("수정 및 덧그리기 작업 중입니다..."):
             out_stream = io.BytesIO()
-            if is_pdf:
+            if file_ext == '.pdf':
                 core.apply_corrections_to_pdf(doc_obj, st.session_state.corrections)
                 doc_obj.save(out_stream)
                 doc_obj.close()
                 mime_type = "application/pdf"
                 btn_label = "💖 교정 하이라이트 PDF 다운로드"
-                file_ext = "pdf"
-            else:
+                download_name = f"완료_{uploaded_file.name}"
+            elif file_ext == '.pptx':
                 core.apply_corrections_to_ppt(doc_obj, st.session_state.corrections)
                 doc_obj.save(out_stream)
                 mime_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 btn_label = "💖 핑크색 교정 반영본 PPTX 다운로드"
-                file_ext = "pptx"
+                download_name = f"완료_{uploaded_file.name}"
+            elif file_ext == '.docx':
+                core.apply_corrections_to_docx(doc_obj, st.session_state.corrections)
+                doc_obj.save(out_stream)
+                mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                btn_label = "💖 핑크색 교정 반영본 DOCX 다운로드"
+                download_name = f"완료_{uploaded_file.name}"
+            elif file_ext in ('.hwp', '.hwpx'):
+                try:
+                    full_txt = st.session_state.full_text or ""
+                    corrections = st.session_state.corrections or {}
+                    # 한글 본문 텍스트와 교정 사전을 바탕으로 Word 문서(.docx) 생성
+                    docx_doc = core.create_docx_from_hwp_text(full_txt, corrections)
+                    docx_doc.save(out_stream)
+                    mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    btn_label = "💖 워드(.docx)로 변환된 교정 반영본 다운로드"
+                    base_name = os.path.splitext(uploaded_file.name)[0]
+                    download_name = f"완료_{base_name}.docx"
+                except Exception as e:
+                    # 예외 발생 시 최종 백업으로 텍스트 파일 제공
+                    corrected_text = core.apply_corrections_to_text(st.session_state.full_text or "", st.session_state.corrections or {})
+                    out_stream.write(corrected_text.encode('utf-8'))
+                    mime_type = "text/plain"
+                    btn_label = "💖 교정 반영본 텍스트 파일(TXT) 다운로드 (대체)"
+                    base_name = os.path.splitext(uploaded_file.name)[0]
+                    download_name = f"완료_{base_name}.txt"
                 
-            out_stream.seek(0)
+            download_data = out_stream.getvalue()
             
         st.download_button(
             label=btn_label,
-            data=out_stream,
-            file_name=f"완료_{uploaded_file.name}",
+            data=download_data,
+            file_name=download_name,
             mime=mime_type,
             use_container_width=True
         )
