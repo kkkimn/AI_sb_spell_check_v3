@@ -9,3 +9,5 @@ pillow
 python-pptx
 python-dotenv
 PyMuPDF
+olefile
+python-docx
