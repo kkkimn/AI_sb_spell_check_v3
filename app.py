@@ -529,6 +529,9 @@ with col_sp:
     sp_options = ["선택 안함"] + list(spelling_dicts.keys()) if 'spelling_dicts' in locals() else ["선택 안함"]
     selected_sp_dict = st.selectbox("검사에 적용할 사용자 맞춤법 사전 (선택)", options=sp_options)
 
+# 엑셀 이미지 포함 옵션 추가
+export_images = st.checkbox("엑셀 다운로드용 슬라이드/페이지 이미지 추출 (LibreOffice/PowerPoint COM 작동, 수십 초 소요)", value=False, help="체크하면 엑셀 파일에 슬라이드 이미지가 삽입되지만, 검사 속도가 느려집니다. 체크 해제 시 이미지 없이 빠르게 다운로드 가능합니다.")
+
 
 if "uploader_id" not in st.session_state:
     st.session_state.uploader_id = 0
@@ -582,6 +585,7 @@ if uploaded_file is not None:
             st.session_state.script_text = None
             st.session_state.full_text = None
             st.session_state.score_result = None
+            st.session_state.img_cache = {}  # 이미지 캐시 초기화
             
             with st.spinner("문서를 스캔하고 대본을 추출하는 중..."):
                 if file_ext == '.pdf':
@@ -676,11 +680,8 @@ if uploaded_file is not None:
             st.session_state.content_reviews = {}
             if active_kb_data and file_ext == '.pptx':
                 with st.spinner(f"OpenAI 내용 검토 스캔 중 (2단계) ({selected_model})..."):
-                    total_slides = len(doc_obj.slides)
-                    for i, slide in enumerate(doc_obj.slides):
-                        slide_num = i + 1
-                        
-                        # 슬라이드 내 텍스트 수집
+                    slide_contents = []
+                    for slide in doc_obj.slides:
                         parts = []
                         for shape in core.iter_shapes(slide.shapes):
                             t = core._safe_shape_text(shape).strip()
@@ -690,16 +691,25 @@ if uploaded_file is not None:
                                     for cell in row.cells:
                                         ct = cell.text.strip()
                                         if ct: parts.append(ct)
+                        slide_contents.append("\n".join(parts))
                         
-                        slide_text = "\n".join(parts)
-                        if slide_text.strip():
-                            feedback = core.get_content_review(slide_text, slide_num, active_kb_data, API_KEY_DEFAULT, model=selected_model)
-                            if feedback:
-                                st.session_state.content_reviews[slide_num] = feedback
-                                
-                        progress = int(((i + 1) / total_slides) * 100)
-                        progress_bar.progress(progress)
-                        status_text.markdown(f"**진행 상황 (내용 검토):** {i+1}/{total_slides} 슬라이드 스캔 완료... ({selected_model} 사용 중)")
+                    progress_bar_rev = st.progress(0)
+                    status_text_rev = st.empty()
+                    
+                    def update_progress_rev(current, total):
+                        progress = int((current / total) * 100)
+                        progress_bar_rev.progress(progress)
+                        status_text_rev.markdown(f"**진행 상황 (내용 검토):** {current}/{total} 슬라이드 검토 완료... ({selected_model} 사용 중)")
+                        
+                    st.session_state.content_reviews = core.get_openai_content_reviews_by_slide_batch(
+                        slide_contents,
+                        active_kb_data,
+                        API_KEY_DEFAULT,
+                        progress_callback=update_progress_rev,
+                        model=selected_model
+                    )
+                    progress_bar_rev.progress(100)
+                    status_text_rev.markdown("**✅ 내용 검토 완료!**")
 
             # ── 점수 계산 ──────────────────────────────────
             if st.session_state.full_text:
@@ -723,6 +733,7 @@ if uploaded_file is not None:
             st.session_state.score_result = None
             st.session_state.locations = None
             st.session_state.content_reviews = {}
+            st.session_state.img_cache = {}  # 이미지 캐시 초기화
             st.rerun()
 
         st.subheader("🏅 문서 품질 점수")
@@ -739,22 +750,32 @@ if uploaded_file is not None:
             st.info("AI가 변경할 곳을 찾지 못했습니다. 문장이 이미 완벽하거나 수정할 내용이 없습니다.")
         else:
             # 엑셀용 이미지 추출 (미리 캐싱)
-            with st.spinner("엑셀 다운로드를 위한 원본 이미지 준비 중 (수 초 소요될 수 있습니다)..."):
+            img_cache = {}
+            if export_images:
+                if "img_cache" not in st.session_state or st.session_state.img_cache is None:
+                    st.session_state.img_cache = {}
+                
                 unique_locs = set()
                 for old in c_dict.keys():
                     locs = loc_dict.get(old, [])
                     if locs:
                         unique_locs.add(locs[0])
                 
-                img_cache = {}
-                if unique_locs:
-                    if file_ext == '.pdf':
-                        for loc in unique_locs:
-                            img_cache[loc] = core.get_pdf_page_image_bytes(doc_obj, loc)
-                    elif file_ext == '.pptx':
-                        uploaded_file.seek(0)
-                        pptx_bytes = uploaded_file.read()
-                        img_cache = core.get_pptx_slide_images(pptx_bytes, list(unique_locs))
+                # 캐시되지 않은 위치의 이미지만 추출하여 캐싱
+                missing_locs = [loc for loc in unique_locs if loc not in st.session_state.img_cache]
+                
+                if missing_locs:
+                    with st.spinner("엑셀 다운로드를 위한 원본 이미지 준비 중 (수 초 소요될 수 있습니다)..."):
+                        if file_ext == '.pdf':
+                            for loc in missing_locs:
+                                st.session_state.img_cache[loc] = core.get_pdf_page_image_bytes(doc_obj, loc)
+                        elif file_ext == '.pptx':
+                            uploaded_file.seek(0)
+                            pptx_bytes = uploaded_file.read()
+                            new_imgs = core.get_pptx_slide_images(pptx_bytes, missing_locs)
+                            st.session_state.img_cache.update(new_imgs)
+                
+                img_cache = st.session_state.img_cache
 
             # 오류 유형 컬럼 추가
             rows = []

@@ -866,25 +866,22 @@ def _has_natural_start(text, word):
 def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict=None,
                                     progress_callback=None, model="gpt-4o"):
     """
-    슬라이드를 하나씩 읽어가면서 문맥을 바탕으로 OpenAI 교정안을 확보합니다.
-    model: 'gpt-4o' (정확) 또는 'gpt-4o-mini' (빠르고 저렴)
+    슬라이드들을 배치 단위로 묶어서 OpenAI 교정안을 확보합니다.
     """
     client = OpenAI(api_key=api_key)
     global_corrections = {}
-    locations = {}
     
     system_prompt = _build_system_prompt(custom_dict, doc_kind="파워포인트 슬라이드")
     total_slides = len(prs.slides)
     
+    # 1. 각 슬라이드의 텍스트 추출 및 캐싱
+    slide_contents = []
     for i, slide in enumerate(prs.slides):
-        # 그룹 도형까지 재귀 순회하여 모든 텍스트 수집
         slide_texts = []
         for shape in iter_shapes(slide.shapes):
-            # 일반 텍스트 도형 (placeholder, autoshape 등 특수 도형도 안전하게 처리)
             t = _safe_shape_text(shape).strip()
             if t and len(t) > 1:
                 slide_texts.append(t)
-            # 표 셀
             if shape.has_table:
                 for row in shape.table.rows:
                     for cell in row.cells:
@@ -897,13 +894,41 @@ def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict
                 slide_texts.append(notes_text)
                             
         full_text = "\n".join([t for t in slide_texts if len(t) > 1])
-        
-        if not full_text.strip():
-            if progress_callback: progress_callback(i + 1, total_slides)
+        slide_contents.append(full_text)
+
+    # 2. 텍스트 배치화 (한 배치는 최대 8개 슬라이드 또는 누적 4000글자)
+    batches = []
+    current_batch_slides = []
+    current_batch_text = []
+    current_char_count = 0
+    
+    for idx, content in enumerate(slide_contents):
+        slide_num = idx + 1
+        if not content.strip():
             continue
             
-        user_prompt = f'=== 슬라이드 {i+1} 텍스트 ===\n{full_text}'
+        if current_char_count + len(content) > 4000 and current_batch_slides:
+            batches.append((current_batch_slides, "\n\n".join(current_batch_text)))
+            current_batch_slides = []
+            current_batch_text = []
+            current_char_count = 0
+            
+        current_batch_slides.append(slide_num)
+        current_batch_text.append(f"=== 슬라이드 {slide_num} 텍스트 ===\n{content}")
+        current_char_count += len(content)
+        
+        if len(current_batch_slides) >= 8:
+            batches.append((current_batch_slides, "\n\n".join(current_batch_text)))
+            current_batch_slides = []
+            current_batch_text = []
+            current_char_count = 0
+            
+    if current_batch_slides:
+        batches.append((current_batch_slides, "\n\n".join(current_batch_text)))
 
+    # 3. 배치 루프 실행 및 API 호출
+    for batch_idx, (slide_nums, batch_text) in enumerate(batches):
+        user_prompt = batch_text
         success = False
         for attempt in range(5):
             try:
@@ -926,21 +951,14 @@ def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict
                     
                     if not k_str or not v_str: continue
                     if k_str == v_str: continue
-                    # 단일 부호·공백만 제외 (1글자짜리 정상 한글 교정은 살림)
                     if len(k_str) == 1 and k_str in {" ", ".", ",", "!", "?", "-", "_", "·", "/"}: continue
                     
                     if _is_custom_dict_violation(k_str, v_str, custom_dict):
-                        print(f"   [사용자 사전] 슬라이드 {i+1} 교정 차단: '{k_str}' → '{v_str}'")
+                        print(f"   [사용자 사전] 교정 차단: '{k_str}' → '{v_str}'")
                         continue
                     
-                    # 충돌 시 덮어쓰지 않음 (먼저 등록된 교정을 보존)
                     if k_str not in global_corrections:
                         global_corrections[k_str] = v_str
-                    
-                    if k_str not in locations:
-                        locations[k_str] = []
-                    if (i + 1) not in locations[k_str]:
-                        locations[k_str].append(i + 1)
                 
                 success = True
                 break
@@ -948,7 +966,7 @@ def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict
             except Exception as e:
                 err_msg = str(e)
                 if "rate limit" in err_msg.lower() or "429" in err_msg:
-                    print(f"   [API 한도 초과] 5초 대기 후 슬라이드 {i+1} 재시도... ({attempt+1}/5)")
+                    print(f"   [API 한도 초과] 5초 대기 후 재시도... ({attempt+1}/5)")
                     time.sleep(5) 
                 else:
                     print(f"   [API 오류] 재시도 중... 사유: {e}")
@@ -958,11 +976,22 @@ def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict
             time.sleep(1)
             
         if progress_callback:
-            progress_callback(i + 1, total_slides)
+            progress_callback(slide_nums[-1], total_slides)
             
+    # 빈 슬라이드가 많아 아예 배치가 없는 경우 프로그레스 백업 호출
+    if not batches and progress_callback:
+        progress_callback(total_slides, total_slides)
+
+    # 4. 로컬 위치 매핑
+    locations = {}
+    for k_str in global_corrections.keys():
+        locations[k_str] = []
+        for idx, content in enumerate(slide_contents):
+            slide_num = idx + 1
+            if k_str in content:
+                locations[k_str].append(slide_num)
+                
     return global_corrections, locations
-
-
 # ==========================================
 # 교정 적용 (PPT)
 # ==========================================
@@ -1098,15 +1127,16 @@ def extract_narrations_pdf(pdf_document):
 def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True, custom_dict=None,
                                        progress_callback=None, model="gpt-4o"):
     """
-    PDF 페이지별 텍스트를 추출해 OpenAI 교정안(JSON)을 받아옵니다.
+    PDF 페이지들을 배치 단위로 묶어서 OpenAI 교정안을 확보합니다.
     """
     client = OpenAI(api_key=api_key)
     global_corrections = {}
-    locations = {}
     
     system_prompt = _build_system_prompt(custom_dict, doc_kind="PDF 문서")
     total_pages = len(pdf_document)
     
+    # 1. 각 페이지의 텍스트 추출 및 캐싱
+    page_contents = []
     for i in range(total_pages):
         page = pdf_document[i]
         blocks = page.get_text("blocks")
@@ -1116,15 +1146,42 @@ def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True,
                 block_txt = b[4].strip()
                 if len(block_txt) > 2 and not block_txt.isdigit():
                     text_lines.append(block_txt)
-        
         full_text = "\n\n".join(text_lines)
-        
-        if not full_text:
-            if progress_callback: progress_callback(i + 1, total_pages)
+        page_contents.append(full_text)
+
+    # 2. 텍스트 배치화 (한 배치는 최대 8개 페이지 또는 누적 4000글자)
+    batches = []
+    current_batch_pages = []
+    current_batch_text = []
+    current_char_count = 0
+    
+    for idx, content in enumerate(page_contents):
+        page_num = idx + 1
+        if not content.strip():
             continue
             
-        user_prompt = f'=== 페이지 {i+1} 텍스트 ===\n{full_text}'
+        if current_char_count + len(content) > 4000 and current_batch_pages:
+            batches.append((current_batch_pages, "\n\n".join(current_batch_text)))
+            current_batch_pages = []
+            current_batch_text = []
+            current_char_count = 0
+            
+        current_batch_pages.append(page_num)
+        current_batch_text.append(f"=== 페이지 {page_num} 텍스트 ===\n{content}")
+        current_char_count += len(content)
+        
+        if len(current_batch_pages) >= 8:
+            batches.append((current_batch_pages, "\n\n".join(current_batch_text)))
+            current_batch_pages = []
+            current_batch_text = []
+            current_char_count = 0
+            
+    if current_batch_pages:
+        batches.append((current_batch_pages, "\n\n".join(current_batch_text)))
 
+    # 3. 배치 루프 실행 및 API 호출
+    for batch_idx, (page_nums, batch_text) in enumerate(batches):
+        user_prompt = batch_text
         success = False
         for attempt in range(5):
             try:
@@ -1150,17 +1207,11 @@ def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True,
                     if len(k_str) == 1 and k_str in {" ", ".", ",", "!", "?", "-", "_", "·", "/"}: continue
                     
                     if _is_custom_dict_violation(k_str, v_str, custom_dict):
-                        print(f"   [사용자 사전] 페이지 {i+1} 교정 차단: '{k_str}' → '{v_str}'")
+                        print(f"   [사용자 사전] 교정 차단: '{k_str}' → '{v_str}'")
                         continue
                     
                     if k_str not in global_corrections:
                         global_corrections[k_str] = v_str
-                    
-                    if k_str not in locations:
-                        locations[k_str] = []
-                    if (i + 1) not in locations[k_str]:
-                        locations[k_str].append(i + 1)
-
                 
                 success = True
                 break
@@ -1168,19 +1219,32 @@ def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True,
             except Exception as e:
                 err_msg = str(e)
                 if "rate limit" in err_msg.lower() or "429" in err_msg:
+                    print(f"   [API 한도 초과] 5초 대기 후 재시도... ({attempt+1}/5)")
                     time.sleep(5) 
                 else:
+                    print(f"   [API 오류] 재시도 중... 사유: {e}")
                     time.sleep(2)
                     
         if success and not is_paid_tier:
             time.sleep(1)
             
         if progress_callback:
-            progress_callback(i + 1, total_pages)
+            progress_callback(page_nums[-1], total_pages)
             
+    # 빈 페이지가 많아 아예 배치가 없는 경우 프로그레스 백업 호출
+    if not batches and progress_callback:
+        progress_callback(total_pages, total_pages)
+
+    # 4. 로컬 위치 매핑
+    locations = {}
+    for k_str in global_corrections.keys():
+        locations[k_str] = []
+        for idx, content in enumerate(page_contents):
+            page_num = idx + 1
+            if k_str in content:
+                locations[k_str].append(page_num)
+                
     return global_corrections, locations
-
-
 def apply_corrections_to_pdf(pdf_document, corrections_dict):
     """
     교정 딕셔너리를 바탕으로 PDF 원문에 핫핑크색 하이라이트 어노테이션을 그린다.
@@ -1767,7 +1831,7 @@ def get_openai_corrections_hwp_text(full_text, api_key, is_paid_tier=True, custo
     # 문장이나 줄 바꿈 기준으로 나눔
     lines = [line.strip() for line in full_text.split('\n') if line.strip()]
     
-    chunk_size = 15
+    chunk_size = 40
     chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
     total_chunks = len(chunks)
     
@@ -1890,7 +1954,7 @@ def get_openai_corrections_docx(doc, api_key, is_paid_tier=True, custom_dict=Non
                     if t: texts.append(t)
                     
     # 약 10문단씩 청크로 묶어서 스캔
-    chunk_size = 10
+    chunk_size = 30
     chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
     total_chunks = len(chunks)
     
@@ -2247,3 +2311,91 @@ def create_docx_from_hwp_text(full_text, corrections_dict):
 
 
 
+
+
+def get_openai_content_reviews_by_slide_batch(slide_contents, knowledge_data, api_key, progress_callback=None, model="gpt-4o"):
+    """
+    여러 슬라이드의 내용을 배치 단위로 묶어 OpenAI를 통해 내용 검토 피드백을 생성합니다.
+    """
+    client = OpenAI(api_key=api_key)
+    content_reviews = {}
+    
+    summary = knowledge_data.get("summary", "")
+    terms = ", ".join(knowledge_data.get("terms", []))
+    
+    system_prompt = (
+        "너는 프레젠테이션 내용 검수 전문가야. 아래 [배경 지식]을 바탕으로 제공된 각 슬라이드의 내용에 "
+        "사실과 다르거나, 중요한 개념이 누락되었거나, 부적절하게 설명된 부분이 있는지 검토해라.\n\n"
+        f"[배경 지식]\n요약: {summary}\n관련 용어: {terms}\n\n"
+        "각 슬라이드별로 지적 사항이나 개선할 점이 있다면 짧고 명확하게 1~2문장으로 피드백을 작성해라.\n"
+        "반드시 JSON 객체 형식으로 응답해라. 키는 슬라이드 번호(예: \"1\", \"2\")이고, 값은 피드백 내용 문자열이다.\n"
+        "검토 시 문제가 없고 잘 작성된 슬라이드는 결과 JSON에 포함하지 않거나 빈 문자열(\"\")로 지정해라."
+    )
+    
+    # 텍스트 배치화
+    batches = []
+    current_batch_slides = []
+    current_batch_text = []
+    current_char_count = 0
+    
+    for idx, content in enumerate(slide_contents):
+        slide_num = idx + 1
+        if not content.strip():
+            continue
+            
+        if current_char_count + len(content) > 4000 and current_batch_slides:
+            batches.append((current_batch_slides, "\n\n".join(current_batch_text)))
+            current_batch_slides = []
+            current_batch_text = []
+            current_char_count = 0
+            
+        current_batch_slides.append(slide_num)
+        current_batch_text.append(f"=== 슬라이드 {slide_num} 내용 ===\n{content}")
+        current_char_count += len(content)
+        
+        if len(current_batch_slides) >= 8:
+            batches.append((current_batch_slides, "\n\n".join(current_batch_text)))
+            current_batch_slides = []
+            current_batch_text = []
+            current_char_count = 0
+            
+    if current_batch_slides:
+        batches.append((current_batch_slides, "\n\n".join(current_batch_text)))
+        
+    total_slides = len(slide_contents)
+    
+    for batch_idx, (slide_nums, batch_text) in enumerate(batches):
+        user_prompt = batch_text
+        success = False
+        for attempt in range(5):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.2
+                )
+                res_text = response.choices[0].message.content.strip()
+                batch_dict = json.loads(res_text)
+                
+                for s_num_str, feedback in batch_dict.items():
+                    try:
+                        s_num = int(s_num_str)
+                    except ValueError:
+                        continue
+                    fb_str = str(feedback).strip()
+                    if fb_str and fb_str != "{}":
+                        if not ("문제" in fb_str and "없" in fb_str) and not ("잘 작성" in fb_str):
+                            content_reviews[s_num] = fb_str
+                success = True
+                break
+            except Exception as e:
+                time.sleep(2)
+                
+        if progress_callback:
+            progress_callback(slide_nums[-1], total_slides)
+            
+    return content_reviews
