@@ -633,7 +633,7 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model="thorough"
+                        model=selected_model
                     )
                 elif file_ext == '.pptx':
                     corrections, locations = core.get_openai_corrections_by_slide(
@@ -642,7 +642,7 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model="thorough"
+                        model=selected_model
                     )
                 elif file_ext == '.docx':
                     corrections, locations = core.get_openai_corrections_docx(
@@ -651,7 +651,7 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model="thorough"
+                        model=selected_model
                     )
                 elif file_ext in ('.hwp', '.hwpx'):
                     corrections, locations = core.get_openai_corrections_hwp_text(
@@ -660,7 +660,7 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model="thorough"
+                        model=selected_model
                     )
                 st.session_state.corrections = corrections
                 st.session_state.locations = locations
@@ -695,7 +695,7 @@ if uploaded_file is not None:
                         active_kb_data,
                         API_KEY_DEFAULT,
                         progress_callback=update_progress_rev,
-                        model="thorough"
+                        model=selected_model
                     )
                     progress_bar_rev.progress(100)
                     status_text_rev.markdown("**✅ 내용 검토 완료!**")
