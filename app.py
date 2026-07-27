@@ -41,7 +41,7 @@ st.markdown(
 )
 
 st.title("✨AI 품질관리 시스템(원고, 스토리보드 검토)")
-st.markdown("압도적 성능의 **OpenAI (GPT-5.4)** AI를 사용하여 PPT 문맥을 파악하고 맞춤법을 전수 검사합니다.")
+
 
 # 로고 (사이드바 열림/닫힘 모두 표시)
 _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ARASoft로고.png")
@@ -91,18 +91,7 @@ if os.path.exists(_logo_path):
 # 사이드바
 
 with st.sidebar:
-    st.divider()
-    st.subheader("⚙️ AI 모델 선택")
-
-
-    model_choice = st.radio(
-        "정확도와 속도/비용 사이에서 선택하세요.",
-        options=["꼼꼼 모드 (gpt-5.4)", "빠른 모드 (gpt-5.4-mini)"],
-        index=0,
-        help="꼼꼼 모드는 한국어 맞춤법·띄어쓰기·외래어 표기를 훨씬 정확하게 잡아냅니다. "
-             "빠른 모드는 5~10배 저렴하지만 정확도가 떨어집니다."
-    )
-    selected_model = "gpt-5.4" if "gpt-5.4)" in model_choice else "gpt-5.4-mini"
+    selected_model = "gpt-5.6-sol"
 
     st.divider()
     st.subheader("🧠 AI 사전 학습 (지식 베이스)")
@@ -157,11 +146,11 @@ with st.sidebar:
                         st.error(f"파일 읽기 오류: {e}")
                         
                     if file_text.strip():
-                        kb_data = core.generate_knowledge_from_text(file_text, API_KEY_DEFAULT, model="gpt-4o")
+                        kb_data = core.generate_knowledge_from_text(file_text, API_KEY_DEFAULT, model="gpt-5.6-sol")
                     else:
                         st.error("문서에서 텍스트를 추출하지 못했습니다.")
                 else:
-                    kb_data = core.generate_knowledge(target_keyword, API_KEY_DEFAULT, model="gpt-4o")
+                    kb_data = core.generate_knowledge(target_keyword, API_KEY_DEFAULT, model="gpt-5.6-sol")
                     
                 if kb_data:
                     knowledge_base[target_keyword] = kb_data
@@ -644,7 +633,7 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model=selected_model
+                        model="thorough"
                     )
                 elif file_ext == '.pptx':
                     corrections, locations = core.get_openai_corrections_by_slide(
@@ -653,7 +642,7 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model=selected_model
+                        model="thorough"
                     )
                 elif file_ext == '.docx':
                     corrections, locations = core.get_openai_corrections_docx(
@@ -662,7 +651,7 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model=selected_model
+                        model="thorough"
                     )
                 elif file_ext in ('.hwp', '.hwpx'):
                     corrections, locations = core.get_openai_corrections_hwp_text(
@@ -671,7 +660,7 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model=selected_model
+                        model="thorough"
                     )
                 st.session_state.corrections = corrections
                 st.session_state.locations = locations
@@ -706,7 +695,7 @@ if uploaded_file is not None:
                         active_kb_data,
                         API_KEY_DEFAULT,
                         progress_callback=update_progress_rev,
-                        model=selected_model
+                        model="thorough"
                     )
                     progress_bar_rev.progress(100)
                     status_text_rev.markdown("**✅ 내용 검토 완료!**")

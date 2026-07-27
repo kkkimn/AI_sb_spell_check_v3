@@ -8,6 +8,30 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from openai import OpenAI
 import fitz  # PyMuPDF
 
+from openai.resources.chat.completions import Completions
+
+# Store original create method
+_orig_create = Completions.create
+
+def safe_create(self, *args, **kwargs):
+    """
+    OpenAI API 호출을 안전하게 감싸고, temperature 미지원 에러 발생 시
+    해당 인자를 제거하고 재시도합니다.
+    """
+    try:
+        return _orig_create(self, *args, **kwargs)
+    except Exception as e:
+        msg = str(e)
+        if "temperature" in msg and ("support" in msg or "invalid" in msg or "unsupported" in msg) and "temperature" in kwargs:
+            kwargs.pop("temperature", None)
+            try:
+                return _orig_create(self, *args, **kwargs)
+            except Exception as e2:
+                raise e2
+        raise e
+
+Completions.create = safe_create
+
 
 def _clean_xml_compatible_string(s):
     """
@@ -864,7 +888,7 @@ def _has_natural_start(text, word):
 # OpenAI 교정 (PPT)
 # ==========================================
 def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict=None,
-                                    progress_callback=None, model="gpt-4o"):
+                                    progress_callback=None, model="gpt-5.6-sol"):
     """
     슬라이드들을 배치 단위로 묶어서 OpenAI 교정안을 확보합니다.
     """
@@ -1125,7 +1149,7 @@ def extract_narrations_pdf(pdf_document):
 
 
 def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True, custom_dict=None,
-                                       progress_callback=None, model="gpt-4o"):
+                                       progress_callback=None, model="gpt-5.6-sol"):
     """
     PDF 페이지들을 배치 단위로 묶어서 OpenAI 교정안을 확보합니다.
     """
@@ -1605,7 +1629,7 @@ def get_pptx_slide_images(pptx_bytes, slide_nums):
 # 지식 베이스(사전 학습) 생성 및 내용 검토 (AI 호출)
 # ==========================================
 
-def generate_knowledge(keyword, api_key, model="gpt-4o"):
+def generate_knowledge(keyword, api_key, model="gpt-5.6-sol"):
     """
     키워드를 받아 OpenAI를 통해 관련 전문 용어 목록과 핵심 요약 지식을 생성한다.
     """
@@ -1640,7 +1664,7 @@ def generate_knowledge(keyword, api_key, model="gpt-4o"):
         print(f"지식 생성 실패: {e}")
         return None
 
-def get_content_review(slide_text, slide_num, knowledge_data, api_key, model="gpt-4o"):
+def get_content_review(slide_text, slide_num, knowledge_data, api_key, model="gpt-5.6-sol"):
     """
     특정 슬라이드의 텍스트와 학습된 지식(knowledge_data)을 바탕으로 내용 검토 피드백을 생성한다.
     반환: 리뷰 코멘트 문자열 (문제가 없으면 None)
@@ -1682,7 +1706,7 @@ def get_content_review(slide_text, slide_num, knowledge_data, api_key, model="gp
         return None
 
 
-def generate_knowledge_from_text(text, api_key, model="gpt-4o"):
+def generate_knowledge_from_text(text, api_key, model="gpt-5.6-sol"):
     """
     제공된 긴 텍스트를 읽고 OpenAI를 통해 관련 전문 용어 목록과 핵심 요약 지식을 생성한다.
     """
@@ -1820,7 +1844,7 @@ def extract_text_hwp(hwp_file):
     return "\n".join(text_parts)
 
 
-def get_openai_corrections_hwp_text(full_text, api_key, is_paid_tier=True, custom_dict=None, progress_callback=None, model="gpt-4o"):
+def get_openai_corrections_hwp_text(full_text, api_key, is_paid_tier=True, custom_dict=None, progress_callback=None, model="gpt-5.6-sol"):
     """
     HWP에서 추출된 텍스트를 청크 단위로 나누어 OpenAI 교정을 실행합니다.
     """
@@ -1933,7 +1957,7 @@ def extract_full_text_docx(doc):
     return ' '.join(parts)
 
 
-def get_openai_corrections_docx(doc, api_key, is_paid_tier=True, custom_dict=None, progress_callback=None, model="gpt-4o"):
+def get_openai_corrections_docx(doc, api_key, is_paid_tier=True, custom_dict=None, progress_callback=None, model="gpt-5.6-sol"):
     """
     DOCX 문서를 문단 단위 혹은 청크 단위로 나누어 OpenAI 교정을 실행합니다.
     """
@@ -2309,11 +2333,7 @@ def create_docx_from_hwp_text(full_text, corrections_dict):
             
     return doc
 
-
-
-
-
-def get_openai_content_reviews_by_slide_batch(slide_contents, knowledge_data, api_key, progress_callback=None, model="gpt-4o"):
+def get_openai_content_reviews_by_slide_batch(slide_contents, knowledge_data, api_key, progress_callback=None, model="gpt-5.6-sol"):
     """
     여러 슬라이드의 내용을 배치 단위로 묶어 OpenAI를 통해 내용 검토 피드백을 생성합니다.
     """

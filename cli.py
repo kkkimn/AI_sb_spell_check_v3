@@ -10,7 +10,7 @@ load_dotenv()
 API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 def process_file_cli(input_path, is_paid_tier=True):
-    print(f"\n[{input_path}] OpenAI GPT-4o-mini AI 스캐닝(문서별) 교정을 시작합니다...")
+    print(f"\n[{input_path}] OpenAI gpt-5.6-sol AI 스캐닝(문서별) 교정을 시작합니다...")
     if is_paid_tier:
         print("  ▶ [유료 요금제 모드] API 딜레이 대기 없이 최고 속도로 스캔합니다.")
     if not os.path.exists(input_path):
