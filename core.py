@@ -1629,6 +1629,285 @@ def get_pptx_slide_images(pptx_bytes, slide_nums):
 # 지식 베이스(사전 학습) 생성 및 내용 검토 (AI 호출)
 # ==========================================
 
+def extract_reference_document_text(filename, file_bytes):
+    """강의계획서 등 분석 기준 문서에서 텍스트를 추출한다."""
+    import io
+    import os
+
+    ext = os.path.splitext(filename)[1].lower()
+    stream = io.BytesIO(file_bytes)
+
+    if ext == ".hwp":
+        return extract_text_hwp(file_bytes)
+    if ext == ".hwpx":
+        return extract_text_hwpx(file_bytes)
+    if ext == ".pdf":
+        pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
+        try:
+            return extract_full_text_pdf(pdf_document)
+        finally:
+            pdf_document.close()
+    if ext == ".pptx":
+        return extract_full_text_pptx(Presentation(stream))
+    if ext == ".docx":
+        import docx
+        return extract_full_text_docx(docx.Document(stream))
+    if ext == ".txt":
+        return file_bytes.decode("utf-8", errors="ignore")
+
+    raise ValueError(f"지원하지 않는 기준 문서 형식입니다: {ext}")
+
+
+def analyze_document_against_reference(
+    document_text,
+    reference_text,
+    api_key,
+    document_name="검사 문서",
+    reference_name="강의계획서",
+    lesson_label="전체/자동",
+    model="gpt-5.6-sol",
+):
+    """원고·스토리보드가 강의계획서의 목표와 범위를 충실히 반영했는지 분석한다."""
+    if not document_text or not document_text.strip():
+        raise ValueError("분석할 원고·스토리보드 내용이 없습니다.")
+    if not reference_text or not reference_text.strip():
+        raise ValueError("강의계획서에서 추출된 내용이 없습니다.")
+
+    # 업로드 문서가 매우 큰 경우에도 프롬프트가 과도하게 커지지 않도록 제한한다.
+    reference_text = reference_text.strip()[:30000]
+    document_text = document_text.strip()[:60000]
+    client = OpenAI(api_key=api_key)
+
+    system_prompt = (
+        "너는 대학 강의 콘텐츠 품질 검수 전문가다. 제공된 강의계획서를 유일한 분석 기준으로 삼아 "
+        "원고 또는 스토리보드가 강의 목표, 학습 내용, 주차별 범위, 핵심 개념, 평가 방향과 대상 학습자 수준을 "
+        "얼마나 충실하게 반영했는지 검토해라. 강의계획서에 없는 내용을 사실처럼 추정하지 말고, "
+        "각 판단에는 두 문서에서 확인되는 구체적인 근거를 사용해라. 맞춤법이나 문장 교정은 다루지 마라.\n\n"
+        "반드시 아래 형식의 JSON 객체만 반환해라.\n"
+        "{\n"
+        '  "overall_score": 0부터 100까지의 정수,\n'
+        '  "verdict": "한 문장 판정",\n'
+        '  "summary": "전체 정합성에 대한 2~4문장 총평",\n'
+        '  "strengths": ["잘 반영된 내용과 근거", ...],\n'
+        '  "gaps": [\n'
+        "    {\n"
+        '      "criterion": "누락 또는 불일치한 기준",\n'
+        '      "reference_evidence": "강의계획서 근거",\n'
+        '      "document_evidence": "검사 문서의 현재 상태 또는 해당 내용 없음",\n'
+        '      "recommendation": "구체적인 보완 방법"\n'
+        "    }\n"
+        "  ],\n"
+        '  "recommendations": ["우선순위가 높은 전체 수정 권고", ...]\n'
+        "}\n"
+        "잘 반영된 부분이 없거나 누락이 없으면 해당 배열을 빈 배열로 반환해라."
+    )
+    user_prompt = (
+        f"[사용자가 지정한 검토 범위: {lesson_label}]\n"
+        "검토 범위가 특정 차시이면 강의계획서의 해당 차시 내용과 학습목표를 가장 우선적인 기준으로 사용해라.\n\n"
+        f"[분석 기준 문서: {reference_name}]\n{reference_text}\n\n"
+        f"[검사 대상 문서: {document_name}]\n{document_text}"
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+    result = json.loads(response.choices[0].message.content.strip())
+
+    try:
+        result["overall_score"] = max(0, min(100, int(result.get("overall_score", 0))))
+    except (TypeError, ValueError):
+        result["overall_score"] = 0
+    result["verdict"] = str(result.get("verdict") or "")
+    result["summary"] = str(result.get("summary") or "")
+    for list_key in ("strengths", "gaps", "recommendations"):
+        value = result.get(list_key)
+        if value is None:
+            result[list_key] = []
+        elif not isinstance(value, list):
+            result[list_key] = [value]
+    return result
+
+
+def build_document_content_sections(file_ext, doc_obj=None, full_text="", chunk_size=20):
+    """문서 형식별로 위치 정보가 포함된 내용 검토 구간을 만든다."""
+    sections = []
+
+    if file_ext == ".pptx" and doc_obj is not None:
+        for idx, slide in enumerate(doc_obj.slides, 1):
+            parts = []
+            for shape in iter_shapes(slide.shapes):
+                text = _safe_shape_text(shape).strip()
+                if text:
+                    parts.append(text)
+                if shape.has_table:
+                    for row in shape.table.rows:
+                        for cell in row.cells:
+                            cell_text = cell.text.strip()
+                            if cell_text:
+                                parts.append(cell_text)
+            if slide.has_notes_slide:
+                notes_text = slide.notes_slide.notes_text_frame.text.strip()
+                if notes_text:
+                    parts.append(f"[발표자 노트]\n{notes_text}")
+            section_text = "\n".join(parts).strip()
+            if section_text:
+                sections.append({"location": f"{idx} 슬라이드", "text": section_text})
+        return sections
+
+    if file_ext == ".pdf" and doc_obj is not None:
+        for idx, page in enumerate(doc_obj, 1):
+            page_text = page.get_text("text").strip()
+            if page_text:
+                sections.append({"location": f"{idx} 페이지", "text": page_text})
+        return sections
+
+    if file_ext == ".docx" and doc_obj is not None:
+        paragraphs = [p.text.strip() for p in doc_obj.paragraphs if p.text.strip()]
+        for table in doc_obj.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    paragraphs.append(f"[표] {row_text}")
+        for start in range(0, len(paragraphs), chunk_size):
+            chunk = paragraphs[start:start + chunk_size]
+            if chunk:
+                end = start + len(chunk)
+                sections.append({
+                    "location": f"문단 {start + 1}-{end}",
+                    "text": "\n".join(chunk),
+                })
+        return sections
+
+    lines = [line.strip() for line in (full_text or "").splitlines() if line.strip()]
+    if not lines and full_text and full_text.strip():
+        lines = [full_text.strip()]
+    for start in range(0, len(lines), chunk_size):
+        chunk = lines[start:start + chunk_size]
+        if chunk:
+            end = start + len(chunk)
+            sections.append({
+                "location": f"문단 {start + 1}-{end}",
+                "text": "\n".join(chunk),
+            })
+    return sections
+
+
+def get_openai_content_reviews_by_sections(
+    sections,
+    knowledge_data,
+    api_key,
+    reference_text="",
+    lesson_label="전체/자동",
+    progress_callback=None,
+    model="gpt-5.6-sol",
+):
+    """AI 사전 지식과 강의계획서를 함께 사용해 모든 문서 형식의 위치별 내용 오류를 찾는다."""
+    if not sections:
+        return []
+
+    knowledge_data = knowledge_data or {}
+    summary = str(knowledge_data.get("summary") or "")
+    terms = ", ".join(str(term) for term in (knowledge_data.get("terms") or []))
+    reference_context = (reference_text or "").strip()[:24000]
+    client = OpenAI(api_key=api_key)
+
+    system_prompt = (
+        "너는 대학 강의 원고와 스토리보드의 내용 오류를 찾는 품질 검수 전문가다. "
+        "아래 AI 사전 학습 지식으로 사실·개념·전문 용어의 정확성을 확인하고, 강의계획서가 제공되면 "
+        "사용자가 지정한 차시의 학습목표와 내용 범위에 맞는지도 확인해라. "
+        "근거 없이 오류를 만들지 말고, 확실한 사실 오류·개념 오류·차시 범위 불일치만 보고해라. "
+        "맞춤법과 문체는 이 검토에서 제외해라. 원문 인용은 제공된 구간에서 실제로 존재하는 짧은 문구만 사용해라.\n\n"
+        f"[검토 차시]\n{lesson_label}\n\n"
+        f"[AI 사전 학습 지식]\n핵심 요약: {summary or '선택 안함'}\n전문 용어: {terms or '선택 안함'}\n\n"
+        f"[강의계획서]\n{reference_context or '선택 안함'}\n\n"
+        "반드시 다음 JSON 형식으로만 응답해라.\n"
+        "{\n"
+        '  "issues": [\n'
+        "    {\n"
+        '      "location": "입력에 표시된 위치를 그대로 사용",\n'
+        '      "issue_type": "사실 오류|개념 오류|차시 불일치|범위 이탈|핵심 내용 누락 중 하나",\n'
+        '      "original_excerpt": "문제가 확인되는 원문 일부",\n'
+        '      "issue": "무엇이 왜 잘못되었는지",\n'
+        '      "basis": "AI 사전 지식 또는 강의계획서의 판단 근거",\n'
+        '      "recommendation": "구체적인 수정 방법"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "문제가 없는 구간은 포함하지 말고 issues를 빈 배열로 반환해라. 핵심 내용 누락은 제공된 구간만 보고 "
+        "단정하기 어려우면 보고하지 마라."
+    )
+
+    batches = []
+    current_sections = []
+    current_chars = 0
+    for section in sections:
+        location = str(section.get("location") or "위치 미상")
+        text = str(section.get("text") or "").strip()
+        if not text:
+            continue
+        item = f"=== 위치: {location} ===\n{text}"
+        if current_sections and current_chars + len(item) > 7000:
+            batches.append(current_sections)
+            current_sections = []
+            current_chars = 0
+        current_sections.append(item)
+        current_chars += len(item)
+    if current_sections:
+        batches.append(current_sections)
+
+    issues = []
+    processed = 0
+    total = len(sections)
+    for batch in batches:
+        batch_text = "\n\n".join(batch)
+        batch_success = False
+        last_error = None
+        for attempt in range(5):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": batch_text},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.2,
+                )
+                result = json.loads(response.choices[0].message.content.strip())
+                batch_issues = result.get("issues", []) if isinstance(result, dict) else []
+                if isinstance(batch_issues, list):
+                    for issue in batch_issues:
+                        if isinstance(issue, dict) and str(issue.get("issue") or "").strip():
+                            issues.append({
+                                "location": str(issue.get("location") or "위치 미상"),
+                                "issue_type": str(issue.get("issue_type") or "내용 오류"),
+                                "original_excerpt": str(issue.get("original_excerpt") or ""),
+                                "issue": str(issue.get("issue") or ""),
+                                "basis": str(issue.get("basis") or ""),
+                                "recommendation": str(issue.get("recommendation") or ""),
+                            })
+                batch_success = True
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 4:
+                    time.sleep(2)
+
+        if not batch_success:
+            raise RuntimeError(f"위치별 내용 검토 API 호출에 실패했습니다: {last_error}")
+
+        processed = min(total, processed + len(batch))
+        if progress_callback:
+            progress_callback(processed, total)
+
+    return issues
+
 def generate_knowledge(keyword, api_key, model="gpt-5.6-sol"):
     """
     키워드를 받아 OpenAI를 통해 관련 전문 용어 목록과 핵심 요약 지식을 생성한다.

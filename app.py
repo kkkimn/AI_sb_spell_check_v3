@@ -1,6 +1,9 @@
 import os
 import json
 import base64
+import re
+import shutil
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 from pptx import Presentation
@@ -41,6 +44,412 @@ st.markdown(
 )
 
 st.title("✨AI 품질관리 시스템(원고, 스토리보드 검토)")
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+REVIEW_HISTORY_DIR = os.path.join(APP_DIR, "review_history")
+
+
+def _safe_filename(name):
+    base = os.path.basename(name or "문서")
+    return re.sub(r'[\\/:*?"<>|]+', "_", base).strip() or "문서"
+
+
+def _json_default(value):
+    if hasattr(value, "item"):
+        return value.item()
+    return str(value)
+
+
+def _read_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
+
+
+def _list_review_history(limit=None):
+    if not os.path.isdir(REVIEW_HISTORY_DIR):
+        return []
+
+    records = []
+    for entry in os.listdir(REVIEW_HISTORY_DIR):
+        record_dir = os.path.join(REVIEW_HISTORY_DIR, entry)
+        meta_path = os.path.join(record_dir, "metadata.json")
+        if not os.path.isdir(record_dir) or not os.path.exists(meta_path):
+            continue
+        meta = _read_json(meta_path, {})
+        if not isinstance(meta, dict):
+            continue
+        meta["history_id"] = entry
+        meta["history_dir"] = record_dir
+        records.append(meta)
+
+    records.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    if limit:
+        return records[:limit]
+    return records
+
+
+def _load_review_history(history_id):
+    safe_id = _safe_filename(history_id)
+    record_dir = os.path.join(REVIEW_HISTORY_DIR, safe_id)
+    meta_path = os.path.join(record_dir, "metadata.json")
+    meta = _read_json(meta_path, {})
+    if not isinstance(meta, dict):
+        return None
+    meta["history_id"] = safe_id
+    meta["history_dir"] = record_dir
+    return meta
+
+
+def _save_review_history(metadata, excel_data=None, completed_data=None):
+    os.makedirs(REVIEW_HISTORY_DIR, exist_ok=True)
+
+    history_id = st.session_state.get("current_review_history_id")
+    if not history_id:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name_part = os.path.splitext(_safe_filename(metadata.get("original_name", "문서")))[0][:40]
+        history_id = f"{timestamp}_{name_part}"
+        st.session_state.current_review_history_id = history_id
+
+    record_dir = os.path.join(REVIEW_HISTORY_DIR, history_id)
+    os.makedirs(record_dir, exist_ok=True)
+    existing_metadata = _read_json(os.path.join(record_dir, "metadata.json"), {})
+    if isinstance(existing_metadata, dict) and existing_metadata.get("created_at"):
+        metadata["created_at"] = existing_metadata["created_at"]
+
+    files = metadata.get("files", {})
+    if excel_data:
+        excel_name = _safe_filename(metadata.get("excel_name", "교정결과.xlsx"))
+        with open(os.path.join(record_dir, excel_name), "wb") as f:
+            f.write(excel_data)
+        files["excel"] = excel_name
+
+    if completed_data:
+        completed_name = _safe_filename(metadata.get("completed_name", "완료본"))
+        with open(os.path.join(record_dir, completed_name), "wb") as f:
+            f.write(completed_data)
+        files["completed"] = completed_name
+
+    metadata["files"] = files
+    metadata["history_id"] = history_id
+    metadata["saved_at"] = datetime.now().isoformat(timespec="seconds")
+    _write_json(os.path.join(record_dir, "metadata.json"), metadata)
+    return history_id
+
+
+def _format_history_time(value):
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return value
+
+
+def _parse_history_datetime(value):
+    try:
+        return datetime.fromisoformat(value or "")
+    except Exception:
+        return None
+
+
+def _set_loaded_history(history_id):
+    st.session_state.loaded_history_id = history_id
+    st.session_state.uploader_id = st.session_state.get("uploader_id", 0) + 1
+    st.session_state.corrections = None
+    st.session_state.script_text = None
+    st.session_state.full_text = None
+    st.session_state.score_result = None
+    st.session_state.locations = None
+    st.session_state.content_reviews = []
+    st.session_state.alignment_report = None
+    st.session_state.current_review_history_id = None
+
+
+def _delete_review_history(history_id):
+    safe_id = _safe_filename(history_id)
+    record_dir = os.path.abspath(os.path.join(REVIEW_HISTORY_DIR, safe_id))
+    history_root = os.path.abspath(REVIEW_HISTORY_DIR)
+    if not record_dir.startswith(history_root + os.sep):
+        return False
+    if os.path.isdir(record_dir):
+        shutil.rmtree(record_dir)
+        if st.session_state.get("loaded_history_id") == safe_id:
+            st.session_state.loaded_history_id = None
+        return True
+    return False
+
+
+def _filter_history_records(records, search_text, period_option, start_date=None, end_date=None):
+    filtered = records
+    query = (search_text or "").strip().lower()
+    if query:
+        filtered = [
+            record for record in filtered
+            if query in record.get("original_name", "").lower()
+            or query in record.get("history_id", "").lower()
+            or query in record.get("reference", "").lower()
+            or query in record.get("knowledge", "").lower()
+        ]
+
+    now = datetime.now()
+    if period_option == "오늘":
+        start_dt = datetime(now.year, now.month, now.day)
+        filtered = [
+            record for record in filtered
+            if (dt := _parse_history_datetime(record.get("created_at"))) and dt >= start_dt
+        ]
+    elif period_option == "최근 7일":
+        start_dt = now - pd.Timedelta(days=7)
+        filtered = [
+            record for record in filtered
+            if (dt := _parse_history_datetime(record.get("created_at"))) and dt >= start_dt
+        ]
+    elif period_option == "최근 30일":
+        start_dt = now - pd.Timedelta(days=30)
+        filtered = [
+            record for record in filtered
+            if (dt := _parse_history_datetime(record.get("created_at"))) and dt >= start_dt
+        ]
+    elif period_option == "직접 지정" and start_date and end_date:
+        start_dt = datetime.combine(start_date, datetime.min.time())
+        end_dt = datetime.combine(end_date, datetime.max.time())
+        filtered = [
+            record for record in filtered
+            if (dt := _parse_history_datetime(record.get("created_at"))) and start_dt <= dt <= end_dt
+        ]
+
+    return filtered
+
+
+def _sort_history_records(records, sort_option):
+    if sort_option == "오래된순":
+        return sorted(records, key=lambda item: item.get("created_at", ""))
+    if sort_option == "오류 많은 순":
+        return sorted(records, key=lambda item: item.get("correction_count", 0), reverse=True)
+    if sort_option == "파일명순":
+        return sorted(records, key=lambda item: item.get("original_name", ""))
+    return sorted(records, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+def _render_history_manager_content():
+    records = _list_review_history()
+    st.caption(f"전체 저장 기록 {len(records)}개")
+
+    search_text = st.text_input("검색", placeholder="파일명, 지식명, 강의계획서명으로 검색", key="history_search_text")
+    col_period, col_sort, col_page_size = st.columns([1.2, 1, 0.8])
+    with col_period:
+        period_option = st.selectbox(
+            "기간 필터",
+            ["전체", "오늘", "최근 7일", "최근 30일", "직접 지정"],
+            key="history_period_option",
+        )
+    with col_sort:
+        sort_option = st.selectbox(
+            "정렬",
+            ["최신순", "오래된순", "오류 많은 순", "파일명순"],
+            key="history_sort_option",
+        )
+    with col_page_size:
+        page_size = st.selectbox("페이지당", [5, 10, 20, 50], index=1, key="history_page_size")
+
+    start_date = None
+    end_date = None
+    if period_option == "직접 지정":
+        date_col1, date_col2 = st.columns(2)
+        with date_col1:
+            start_date = st.date_input("시작일", key="history_start_date")
+        with date_col2:
+            end_date = st.date_input("종료일", key="history_end_date")
+
+    filtered_records = _filter_history_records(records, search_text, period_option, start_date, end_date)
+    filtered_records = _sort_history_records(filtered_records, sort_option)
+
+    total_pages = max(1, (len(filtered_records) + page_size - 1) // page_size)
+    current_page = min(st.session_state.get("history_page", 1), total_pages)
+    st.session_state.history_page = current_page
+
+    nav_col1, nav_col2, nav_col3, nav_col4 = st.columns([1, 1, 2, 1])
+    with nav_col1:
+        if st.button("이전", disabled=current_page <= 1, key="history_prev_page"):
+            st.session_state.history_page = max(1, current_page - 1)
+            st.rerun()
+    with nav_col2:
+        if st.button("다음", disabled=current_page >= total_pages, key="history_next_page"):
+            st.session_state.history_page = min(total_pages, current_page + 1)
+            st.rerun()
+    with nav_col3:
+        st.caption(f"{current_page} / {total_pages} 페이지 · 검색 결과 {len(filtered_records)}개")
+    with nav_col4:
+        delete_enabled = st.checkbox("삭제 활성화", key="history_delete_enabled")
+
+    start_idx = (current_page - 1) * page_size
+    page_records = filtered_records[start_idx:start_idx + page_size]
+
+    if not page_records:
+        st.info("조건에 맞는 검토 기록이 없습니다.")
+        return
+
+    for record in page_records:
+        title = record.get("original_name", "문서")
+        created = _format_history_time(record.get("created_at"))
+        error_count = record.get("correction_count", 0)
+        reference = record.get("reference", "사용 안함")
+        knowledge = record.get("knowledge", "선택 안함")
+
+        row_view, row_delete = st.columns([4, 1])
+        with row_view:
+            st.markdown(f"**{created} · {title}**")
+            st.caption(f"오류 {error_count}건 · 지식: {knowledge} · 강의계획서: {reference}")
+            if st.button("이 검토 결과 열기", key=f"manager_load_{record['history_id']}", use_container_width=True):
+                _set_loaded_history(record["history_id"])
+                st.session_state.show_history_manager = False
+                st.rerun()
+        with row_delete:
+            if st.button("삭제", key=f"manager_delete_{record['history_id']}", disabled=not delete_enabled, use_container_width=True):
+                if _delete_review_history(record["history_id"]):
+                    st.success("삭제되었습니다.")
+                    st.rerun()
+                else:
+                    st.error("삭제하지 못했습니다.")
+
+
+def _show_history_manager():
+    if hasattr(st, "dialog"):
+        try:
+            dialog_decorator = st.dialog("검토 기록 전체 보기", width="large")
+        except TypeError:
+            dialog_decorator = st.dialog("검토 기록 전체 보기")
+
+        @dialog_decorator
+        def _history_dialog():
+            if st.button("닫기", key="close_history_dialog"):
+                st.session_state.show_history_manager = False
+                st.rerun()
+            _render_history_manager_content()
+
+        _history_dialog()
+    else:
+        with st.expander("검토 기록 전체 보기", expanded=True):
+            if st.button("닫기", key="close_history_panel"):
+                st.session_state.show_history_manager = False
+                st.rerun()
+            _render_history_manager_content()
+
+
+def _build_correction_rows(corrections, locations, file_ext):
+    rows = []
+    label_map = {'spelling': '맞춤법/오타', 'foreign': '외래어 표기', 'spacing': '띄어쓰기'}
+    for old, new in (corrections or {}).items():
+        locs = (locations or {}).get(old, [])
+        loc_str = ", ".join(map(str, locs))
+        if loc_str:
+            if file_ext == '.pdf':
+                loc_str += " 페이지"
+            elif file_ext == '.pptx':
+                loc_str += " 슬라이드"
+        rows.append({
+            "발생 위치": loc_str,
+            "수정 전(원본)": old,
+            "수정 후(AI 제안)": new,
+            "오류 유형": label_map.get(core.classify_error(old, new), '기타')
+        })
+    return rows
+
+
+def _render_saved_history_record(record):
+    st.subheader("📚 저장된 검토 결과")
+    st.caption(f"{record.get('original_name', '문서')} · {_format_history_time(record.get('created_at'))}")
+
+    score_result = record.get("score_result")
+    if score_result:
+        st.markdown("#### 🏅 문서 품질 점수")
+        render_score_dashboard(score_result)
+
+    alignment_report = record.get("alignment_report")
+    if alignment_report:
+        st.markdown("#### 📘 강의계획서 기준 내용 적합성 분석")
+        st.metric("내용 적합성", f"{alignment_report.get('overall_score', 0)}점")
+        if alignment_report.get("verdict"):
+            st.write(alignment_report.get("verdict", ""))
+        if alignment_report.get("summary"):
+            st.info(alignment_report["summary"])
+        gaps = alignment_report.get("gaps") or []
+        if gaps:
+            gap_rows = []
+            for gap in gaps:
+                if isinstance(gap, dict):
+                    gap_rows.append({
+                        "검토 기준": gap.get("criterion", ""),
+                        "강의계획서 근거": gap.get("reference_evidence", ""),
+                        "현재 문서 상태": gap.get("document_evidence", ""),
+                        "보완 제안": gap.get("recommendation", ""),
+                    })
+            if gap_rows:
+                st.dataframe(pd.DataFrame(gap_rows), use_container_width=True, hide_index=True)
+
+    content_reviews = record.get("content_reviews") or []
+    if content_reviews:
+        st.markdown("#### 🔎 위치별 내용 오류 검토")
+        st.dataframe(pd.DataFrame([
+            {
+                "발생 위치": review.get("location", ""),
+                "오류 유형": review.get("issue_type", ""),
+                "문제가 된 원문": review.get("original_excerpt", ""),
+                "검토 의견": review.get("issue", ""),
+                "판단 근거": review.get("basis", ""),
+                "수정 제안": review.get("recommendation", ""),
+            }
+            for review in content_reviews if isinstance(review, dict)
+        ]), use_container_width=True, hide_index=True)
+
+    correction_rows = record.get("correction_rows") or _build_correction_rows(
+        record.get("corrections", {}),
+        record.get("locations", {}),
+        record.get("file_ext", ""),
+    )
+    st.markdown("#### 📋 수정 전 / 수정 후 검토")
+    if correction_rows:
+        st.dataframe(pd.DataFrame(correction_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("AI가 변경할 곳을 찾지 못했던 문서입니다.")
+
+    files = record.get("files") or {}
+    record_dir = record.get("history_dir", "")
+    if files:
+        st.markdown("#### 📥 저장된 파일 다운로드")
+        col_excel, col_completed = st.columns(2)
+        excel_file = files.get("excel")
+        completed_file = files.get("completed")
+        if excel_file:
+            excel_path = os.path.join(record_dir, excel_file)
+            if os.path.exists(excel_path):
+                with open(excel_path, "rb") as f:
+                    col_excel.download_button(
+                        "📊 교정 결과 엑셀 다운로드",
+                        data=f.read(),
+                        file_name=excel_file,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+        if completed_file:
+            completed_path = os.path.join(record_dir, completed_file)
+            if os.path.exists(completed_path):
+                with open(completed_path, "rb") as f:
+                    col_completed.download_button(
+                        "💖 저장된 완성본 다운로드",
+                        data=f.read(),
+                        file_name=completed_file,
+                        mime=record.get("completed_mime", "application/octet-stream"),
+                        use_container_width=True,
+                    )
 
 
 # 로고 (사이드바 열림/닫힘 모두 표시)
@@ -92,6 +501,28 @@ if os.path.exists(_logo_path):
 
 with st.sidebar:
     selected_model = "gpt-5.6-sol"
+
+    st.divider()
+    st.subheader("📚 검토 완료 문서")
+    history_records = _list_review_history()
+    if history_records:
+        for record in history_records[:5]:
+            title = record.get("original_name", "문서")
+            created = _format_history_time(record.get("created_at"))
+            error_count = record.get("correction_count", 0)
+            button_label = f"{created} · {title[:18]} · {error_count}건"
+            if st.button(button_label, key=f"load_history_{record['history_id']}", use_container_width=True):
+                _set_loaded_history(record["history_id"])
+                st.rerun()
+        if st.button("📂 리스트 전체 보기", use_container_width=True):
+            st.session_state.show_history_manager = True
+    else:
+        st.caption("아직 저장된 검토 결과가 없습니다.")
+
+    if st.session_state.get("loaded_history_id"):
+        if st.button("불러온 검토 닫기", use_container_width=True):
+            st.session_state.loaded_history_id = None
+            st.rerun()
 
     st.divider()
     st.subheader("🧠 AI 사전 학습 (지식 베이스)")
@@ -194,6 +625,103 @@ with st.sidebar:
                             del knowledge_base[kw]
                             with open(kb_file_path, "w", encoding="utf-8") as f:
                                 json.dump(knowledge_base, f, ensure_ascii=False, indent=2)
+                            st.rerun()
+
+    st.divider()
+    st.subheader("📘 강의계획서 관리")
+
+    reference_documents_path = "reference_documents.json"
+    reference_documents = {}
+    if os.path.exists(reference_documents_path):
+        with open(reference_documents_path, "r", encoding="utf-8") as f:
+            try:
+                loaded_reference_documents = json.load(f)
+                if isinstance(loaded_reference_documents, dict):
+                    reference_documents = loaded_reference_documents
+            except Exception:
+                pass
+
+    def _save_reference_documents(documents):
+        with open(reference_documents_path, "w", encoding="utf-8") as f:
+            json.dump(documents, f, ensure_ascii=False, indent=2)
+
+    new_reference_name = st.text_input(
+        "강의계획서 이름",
+        placeholder="예: 2026 데이터분석 입문"
+    )
+    new_reference_file = st.file_uploader(
+        "새 강의계획서 업로드",
+        type=["hwp", "hwpx", "docx", "pdf", "pptx", "txt"],
+        key="new_reference_document_uploader"
+    )
+
+    if st.button("➕ 강의계획서 등록"):
+        reference_name = new_reference_name.strip()
+        if new_reference_file and not reference_name:
+            reference_name = os.path.splitext(new_reference_file.name)[0]
+
+        if not new_reference_file:
+            st.error("등록할 강의계획서 파일을 올려주세요.")
+        elif not reference_name:
+            st.error("강의계획서 이름을 입력해주세요.")
+        else:
+            try:
+                new_reference_file.seek(0)
+                extracted_text = core.extract_reference_document_text(
+                    new_reference_file.name,
+                    new_reference_file.read()
+                )
+                if not extracted_text.strip():
+                    st.error("문서에서 텍스트를 추출하지 못했습니다. DOCX 또는 PDF로 변환해 다시 시도해주세요.")
+                else:
+                    reference_documents[reference_name] = {
+                        "source_filename": new_reference_file.name,
+                        "text": extracted_text,
+                    }
+                    _save_reference_documents(reference_documents)
+                    st.success(f"'{reference_name}' 강의계획서가 저장되었습니다.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"강의계획서 등록 오류: {e}")
+
+    if reference_documents:
+        with st.expander("📘 저장된 강의계획서 목록", expanded=False):
+            for reference_name in list(reference_documents.keys()):
+                reference_data = reference_documents[reference_name]
+                reference_length = len(reference_data.get("text", "")) if isinstance(reference_data, dict) else len(str(reference_data))
+
+                if st.session_state.get(f"edit_reference_mode_{reference_name}", False):
+                    renamed_reference = st.text_input(
+                        "새 이름",
+                        value=reference_name,
+                        key=f"new_reference_name_{reference_name}",
+                        label_visibility="collapsed"
+                    )
+                    col_s1, col_s2, col_s3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
+                    with col_s2:
+                        if st.button("💾", key=f"save_reference_{reference_name}", help="저장", type="tertiary"):
+                            renamed_reference = renamed_reference.strip()
+                            if renamed_reference and renamed_reference != reference_name:
+                                reference_documents[renamed_reference] = reference_documents.pop(reference_name)
+                                _save_reference_documents(reference_documents)
+                            st.session_state[f"edit_reference_mode_{reference_name}"] = False
+                            st.rerun()
+                    with col_s3:
+                        if st.button("❌", key=f"cancel_reference_{reference_name}", help="취소", type="tertiary"):
+                            st.session_state[f"edit_reference_mode_{reference_name}"] = False
+                            st.rerun()
+                else:
+                    col1, col2, col3 = st.columns([7.5, 1.2, 1.3], vertical_alignment="center")
+                    with col1:
+                        st.caption(f"- {reference_name} ({reference_length:,}자)")
+                    with col2:
+                        if st.button("✏️", key=f"edit_reference_{reference_name}", help=f"'{reference_name}' 이름 수정", type="tertiary"):
+                            st.session_state[f"edit_reference_mode_{reference_name}"] = True
+                            st.rerun()
+                    with col3:
+                        if st.button("🗑️", key=f"delete_reference_{reference_name}", help=f"'{reference_name}' 삭제", type="tertiary"):
+                            reference_documents.pop(reference_name)
+                            _save_reference_documents(reference_documents)
                             st.rerun()
 
     st.divider()
@@ -491,6 +1019,9 @@ def render_grade_legend():
 
 
 # 메인 영역
+if st.session_state.get("show_history_manager"):
+    _show_history_manager()
+
 st.markdown(
     """
     <div style='background-color: rgba(128, 128, 128, 0.08); padding: 15px; border-radius: 10px; border-left: 5px solid #FF00E5; margin-bottom: 20px; color: inherit;'>
@@ -514,9 +1045,43 @@ with col_kb:
     selected_kb_keyword = st.selectbox("검사에 적용할 사전 학습 지식 (선택)", options=kb_options)
 
 with col_sp:
-    # 맞춤법 사전 선택 (단일 선택)
-    sp_options = ["선택 안함"] + list(spelling_dicts.keys()) if 'spelling_dicts' in locals() else ["선택 안함"]
-    selected_sp_dict = st.selectbox("검사에 적용할 사용자 맞춤법 사전 (선택)", options=sp_options)
+    # 맞춤법 사전 선택 (다중 선택)
+    sp_options = list(spelling_dicts.keys()) if 'spelling_dicts' in locals() else []
+    selected_sp_dicts = st.multiselect(
+        "검사에 적용할 사용자 맞춤법 사전 (다중 선택)",
+        options=sp_options
+    )
+
+st.markdown("#### 📘 강의계획서 기준 분석 (선택)")
+reference_options = ["사용 안함"] + list(reference_documents.keys()) if 'reference_documents' in locals() else ["사용 안함"]
+col_reference, col_lesson = st.columns([2, 1])
+with col_reference:
+    selected_reference_name = st.selectbox(
+        "분석에 적용할 강의계획서",
+        options=reference_options,
+        help="새 강의계획서는 왼쪽 사이드바의 '강의계획서 관리'에서 한 번만 등록하면 됩니다."
+    )
+with col_lesson:
+    lesson_options = ["전체/자동"] + [f"{number}차시" for number in range(1, 13)]
+    selected_lesson_label = st.selectbox(
+        "검토할 차시",
+        options=lesson_options,
+        help="특정 차시를 선택하면 강의계획서에서 해당 차시의 학습목표와 내용 범위를 우선 검토합니다."
+    )
+reference_text = ""
+if selected_reference_name != "사용 안함":
+    selected_reference_data = reference_documents.get(selected_reference_name, {})
+    if isinstance(selected_reference_data, dict):
+        reference_text = selected_reference_data.get("text", "")
+    else:
+        reference_text = str(selected_reference_data)
+
+    if reference_text.strip():
+        st.success(f"'{selected_reference_name}' 강의계획서 적용 준비 완료")
+        with st.expander("저장된 강의계획서 내용 미리보기", expanded=False):
+            st.text(reference_text[:3000] + ("\n..." if len(reference_text) > 3000 else ""))
+    else:
+        st.warning("저장된 강의계획서 내용이 비어 있습니다. 사이드바에서 다시 등록해주세요.")
 
 # 엑셀 이미지 포함 옵션 추가
 export_images = st.checkbox("엑셀 다운로드용 슬라이드/페이지 이미지 추출 (LibreOffice/PowerPoint COM 작동, 수십 초 소요)", value=False, help="체크하면 엑셀 파일에 슬라이드 이미지가 삽입되지만, 검사 속도가 느려집니다. 체크 해제 시 이미지 없이 빠르게 다운로드 가능합니다.")
@@ -535,7 +1100,11 @@ if uploaded_file is not None:
     st.success(f"'{uploaded_file.name}' 업로드 성공!")
     
     # 세션 상태 초기화
-    for key in ['corrections', 'script_text', 'full_text', 'score_result']:
+    for key in [
+        'corrections', 'script_text', 'full_text', 'score_result', 'alignment_report',
+        'alignment_reference_name', 'alignment_lesson_label', 'content_reviews',
+        'content_review_context'
+    ]:
         if key not in st.session_state:
             st.session_state[key] = None
         
@@ -570,10 +1139,17 @@ if uploaded_file is not None:
     with col1:
         if st.button("🚀 AI 분석 및 텍스트 스캔 시작", use_container_width=True):
             # 이전 결과 초기화
+            st.session_state.loaded_history_id = None
+            st.session_state.current_review_history_id = None
             st.session_state.corrections = None
             st.session_state.script_text = None
             st.session_state.full_text = None
             st.session_state.score_result = None
+            st.session_state.alignment_report = None
+            st.session_state.alignment_reference_name = None
+            st.session_state.alignment_lesson_label = None
+            st.session_state.content_reviews = []
+            st.session_state.content_review_context = None
             st.session_state.img_cache = {}  # 이미지 캐시 초기화
             
             with st.spinner("문서를 스캔하고 대본을 추출하는 중..."):
@@ -606,16 +1182,11 @@ if uploaded_file is not None:
                 progress_bar.progress(progress)
                 status_text.markdown(f"**진행 상황 (맞춤법 스캔):** {current}/{total} 페이지/슬라이드 스캔 완료... ({selected_model} 사용 중)")
             
-            # 선택된 맞춤법 사전들로부터 단어 취합 (다중 선택 - 숨김 처리)
-            # custom_dict_list = []
-            # if 'selected_sp_dicts' in locals() and selected_sp_dicts:
-            #     for dn in selected_sp_dicts:
-            #         custom_dict_list.extend(spelling_dicts.get(dn, []))
-            
-            # 선택된 맞춤법 사전으로부터 단어 취합 (단일 선택)
+            # 선택된 맞춤법 사전들로부터 단어 취합
             custom_dict_list = []
-            if 'selected_sp_dict' in locals() and selected_sp_dict != "선택 안함":
-                custom_dict_list.extend(spelling_dicts.get(selected_sp_dict, []))
+            if 'selected_sp_dicts' in locals() and selected_sp_dicts:
+                for dn in selected_sp_dicts:
+                    custom_dict_list.extend(spelling_dicts.get(dn, []))
             
             # 선택된 지식 베이스가 있다면 용어 목록을 맞춤법 예외 사전에 병합
             active_kb_data = None
@@ -665,40 +1236,67 @@ if uploaded_file is not None:
                 st.session_state.corrections = corrections
                 st.session_state.locations = locations
 
-            # 2단계: 내용 검토 (선택된 지식이 있을 때만 수행)
-            st.session_state.content_reviews = {}
-            if active_kb_data and file_ext == '.pptx':
-                with st.spinner(f"OpenAI 내용 검토 스캔 중 (2단계) ({selected_model})..."):
-                    slide_contents = []
-                    for slide in doc_obj.slides:
-                        parts = []
-                        for shape in core.iter_shapes(slide.shapes):
-                            t = core._safe_shape_text(shape).strip()
-                            if t: parts.append(t)
-                            if shape.has_table:
-                                for row in shape.table.rows:
-                                    for cell in row.cells:
-                                        ct = cell.text.strip()
-                                        if ct: parts.append(ct)
-                        slide_contents.append("\n".join(parts))
-                        
+            # 강의계획서 기준 분석은 기존 사전 학습 및 맞춤법 검사와 별도로 수행한다.
+            if reference_text.strip():
+                with st.spinner(f"강의계획서 기준 내용 적합성 분석 중 (2단계) ({selected_model})..."):
+                    try:
+                        st.session_state.alignment_report = core.analyze_document_against_reference(
+                            st.session_state.full_text,
+                            reference_text,
+                            API_KEY_DEFAULT,
+                            document_name=uploaded_file.name,
+                            reference_name=selected_reference_name,
+                            lesson_label=selected_lesson_label,
+                            model=selected_model,
+                        )
+                        st.session_state.alignment_reference_name = selected_reference_name
+                        st.session_state.alignment_lesson_label = selected_lesson_label
+                    except Exception as e:
+                        st.session_state.alignment_report = None
+                        st.session_state.alignment_reference_name = None
+                        st.session_state.alignment_lesson_label = None
+                        st.error(f"강의계획서 기준 분석 중 오류가 발생했습니다: {e}")
+
+            # 모든 문서 형식에 대해 AI 사전 지식과 강의계획서를 함께 사용해 위치별 내용 오류를 찾는다.
+            if active_kb_data or reference_text.strip():
+                with st.spinner(f"AI 사전 지식·강의계획서 기반 위치별 내용 검토 중 ({selected_model})..."):
+                    document_sections = core.build_document_content_sections(
+                        file_ext,
+                        doc_obj=doc_obj,
+                        full_text=st.session_state.full_text or "",
+                    )
                     progress_bar_rev = st.progress(0)
                     status_text_rev = st.empty()
-                    
+
                     def update_progress_rev(current, total):
-                        progress = int((current / total) * 100)
+                        progress = int((current / total) * 100) if total else 100
                         progress_bar_rev.progress(progress)
-                        status_text_rev.markdown(f"**진행 상황 (내용 검토):** {current}/{total} 슬라이드 검토 완료... ({selected_model} 사용 중)")
-                        
-                    st.session_state.content_reviews = core.get_openai_content_reviews_by_slide_batch(
-                        slide_contents,
-                        active_kb_data,
-                        API_KEY_DEFAULT,
-                        progress_callback=update_progress_rev,
-                        model=selected_model
-                    )
-                    progress_bar_rev.progress(100)
-                    status_text_rev.markdown("**✅ 내용 검토 완료!**")
+                        status_text_rev.markdown(
+                            f"**진행 상황 (내용 검토):** {current}/{total}개 구간 검토 완료... ({selected_model} 사용 중)"
+                        )
+
+                    try:
+                        st.session_state.content_reviews = core.get_openai_content_reviews_by_sections(
+                            document_sections,
+                            active_kb_data,
+                            API_KEY_DEFAULT,
+                            reference_text=reference_text,
+                            lesson_label=selected_lesson_label,
+                            progress_callback=update_progress_rev,
+                            model=selected_model,
+                        )
+                        st.session_state.content_review_context = {
+                            "knowledge": selected_kb_keyword,
+                            "reference": selected_reference_name,
+                            "lesson": selected_lesson_label,
+                        }
+                        progress_bar_rev.progress(100)
+                        status_text_rev.markdown("**✅ 위치별 내용 검토 완료!**")
+                    except Exception as e:
+                        st.session_state.content_reviews = []
+                        st.session_state.content_review_context = None
+                        status_text_rev.empty()
+                        st.error(f"위치별 내용 검토 중 오류가 발생했습니다: {e}")
 
             # ── 점수 계산 ──────────────────────────────────
             if st.session_state.full_text:
@@ -721,7 +1319,11 @@ if uploaded_file is not None:
             st.session_state.full_text = None
             st.session_state.score_result = None
             st.session_state.locations = None
-            st.session_state.content_reviews = {}
+            st.session_state.content_reviews = []
+            st.session_state.alignment_report = None
+            st.session_state.alignment_reference_name = None
+            st.session_state.alignment_lesson_label = None
+            st.session_state.content_review_context = None
             st.session_state.img_cache = {}  # 이미지 캐시 초기화
             st.rerun()
 
@@ -730,11 +1332,86 @@ if uploaded_file is not None:
         with st.expander("📘 등급 기준표 보기"):
             render_grade_legend()
 
+    alignment_report = st.session_state.get('alignment_report')
+    if (
+        alignment_report
+        and st.session_state.get('alignment_reference_name') == selected_reference_name
+        and st.session_state.get('alignment_lesson_label') == selected_lesson_label
+    ):
+        st.subheader("📘 강의계획서 기준 내용 적합성 분석")
+        st.caption(f"검토 범위: {selected_lesson_label}")
+        score_col, verdict_col = st.columns([1, 4])
+        with score_col:
+            st.metric("내용 적합성", f"{alignment_report.get('overall_score', 0)}점")
+        with verdict_col:
+            st.markdown("**종합 판정**")
+            st.write(alignment_report.get('verdict', ''))
+
+        if alignment_report.get('summary'):
+            st.info(alignment_report['summary'])
+
+        strengths = alignment_report.get('strengths') or []
+        if strengths:
+            with st.expander("✅ 잘 반영된 내용", expanded=True):
+                for item in strengths:
+                    st.write(f"- {item}")
+
+        gaps = alignment_report.get('gaps') or []
+        if gaps:
+            st.markdown("**누락·불일치 및 보완 사항**")
+            gap_rows = []
+            for gap in gaps:
+                if isinstance(gap, dict):
+                    gap_rows.append({
+                        "검토 기준": gap.get("criterion", ""),
+                        "강의계획서 근거": gap.get("reference_evidence", ""),
+                        "현재 문서 상태": gap.get("document_evidence", ""),
+                        "보완 제안": gap.get("recommendation", ""),
+                    })
+                else:
+                    gap_rows.append({"검토 기준": str(gap), "강의계획서 근거": "", "현재 문서 상태": "", "보완 제안": ""})
+            st.dataframe(pd.DataFrame(gap_rows), use_container_width=True, hide_index=True)
+        else:
+            st.success("강의계획서 기준에서 뚜렷한 누락이나 불일치가 발견되지 않았습니다.")
+
+        recommendations = alignment_report.get('recommendations') or []
+        if recommendations:
+            with st.expander("🛠 우선 수정 권고", expanded=True):
+                for idx, item in enumerate(recommendations, 1):
+                    st.write(f"{idx}. {item}")
+
+    current_content_context = {
+        "knowledge": selected_kb_keyword,
+        "reference": selected_reference_name,
+        "lesson": selected_lesson_label,
+    }
+    content_reviews = st.session_state.get('content_reviews') or []
+    if st.session_state.get('content_review_context') == current_content_context:
+        st.subheader("🔎 위치별 내용 오류 검토")
+        st.caption(f"검토 범위: {selected_lesson_label}")
+        if content_reviews:
+            content_review_df = pd.DataFrame([
+                {
+                    "발생 위치": review.get("location", ""),
+                    "오류 유형": review.get("issue_type", ""),
+                    "문제가 된 원문": review.get("original_excerpt", ""),
+                    "검토 의견": review.get("issue", ""),
+                    "판단 근거": review.get("basis", ""),
+                    "수정 제안": review.get("recommendation", ""),
+                }
+                for review in content_reviews if isinstance(review, dict)
+            ])
+            st.dataframe(content_review_df, use_container_width=True, hide_index=True)
+        else:
+            st.success("선택한 지식과 차시 기준에서 뚜렷한 내용 오류가 발견되지 않았습니다.")
+
     if st.session_state.corrections is not None:
         st.subheader("📋 2. 수정 전 / 수정 후 검토")
         
         c_dict = st.session_state.corrections
         loc_dict = st.session_state.get('locations', {})
+        excel_data = None
+        correction_rows_for_history = _build_correction_rows(c_dict, loc_dict, file_ext)
         if len(c_dict) == 0:
             st.info("AI가 변경할 곳을 찾지 못했습니다. 문장이 이미 완벽하거나 수정할 내용이 없습니다.")
         else:
@@ -771,17 +1448,10 @@ if uploaded_file is not None:
             image_mappings = []
             seen_locs = set()
             
-            for old, new in c_dict.items():
-                err_type = core.classify_error(old, new)
-                label_map = {'spelling': '맞춤법/오타', 'foreign': '외래어 표기', 'spacing': '띄어쓰기'}
-                
+            for row in correction_rows_for_history:
+                old = row["수정 전(원본)"]
                 locs = loc_dict.get(old, [])
-                loc_str = ", ".join(map(str, locs))
-                if loc_str:
-                    if file_ext == '.pdf':
-                        loc_str += " 페이지"
-                    elif file_ext == '.pptx':
-                        loc_str += " 슬라이드"
+                loc_str = row["발생 위치"]
                 
                 if loc_str and loc_str not in seen_locs:
                     img_bytes = img_cache.get(locs[0]) if locs else None
@@ -792,23 +1462,15 @@ if uploaded_file is not None:
                 image_mappings.append(img_bytes)
                 
                 rows.append({
-                    "발생 위치": loc_str,
+                    "발생 위치": row["발생 위치"],
                     "원본 이미지": "",
-                    "수정 전(원본)": old,
-                    "수정 후(AI 제안)": new,
-                    "오류 유형": label_map.get(err_type, '기타')
+                    "수정 전(원본)": row["수정 전(원본)"],
+                    "수정 후(AI 제안)": row["수정 후(AI 제안)"],
+                    "오류 유형": row["오류 유형"]
                 })
             df = pd.DataFrame(rows)
             # 화면에는 이미지 컬럼을 빼고 보여줌
             st.dataframe(df.drop(columns=["원본 이미지"]), use_container_width=True, hide_index=True)
-            
-            # 내용 검토 피드백 렌더링
-            if st.session_state.get('content_reviews'):
-                st.subheader("💡 내용 검토 피드백")
-                review_rows = []
-                for s_num, feedback in st.session_state.content_reviews.items():
-                    review_rows.append({"슬라이드 번호": f"{s_num} 슬라이드", "피드백 내용": feedback})
-                st.dataframe(pd.DataFrame(review_rows), use_container_width=True, hide_index=True)
             
             # 엑셀 다운로드 버튼 추가
             output = io.BytesIO()
@@ -894,15 +1556,29 @@ if uploaded_file is not None:
                 
                 # 내용 검토 시트 추가
                 if st.session_state.get('content_reviews'):
-                    review_df = pd.DataFrame([{"슬라이드 번호": f"{s_num} 슬라이드", "피드백 내용": fb} for s_num, fb in st.session_state.content_reviews.items()])
+                    review_df = pd.DataFrame([
+                        {
+                            "발생 위치": review.get("location", ""),
+                            "오류 유형": review.get("issue_type", ""),
+                            "문제가 된 원문": review.get("original_excerpt", ""),
+                            "검토 의견": review.get("issue", ""),
+                            "판단 근거": review.get("basis", ""),
+                            "수정 제안": review.get("recommendation", ""),
+                        }
+                        for review in st.session_state.content_reviews
+                        if isinstance(review, dict)
+                    ])
                     review_df.to_excel(writer, index=False, sheet_name='내용검토')
                     review_ws = writer.sheets['내용검토']
                     review_ws.set_column('A:A', 20)
-                    review_ws.set_column('B:B', 100)
+                    review_ws.set_column('B:B', 16)
+                    review_ws.set_column('C:F', 45)
                     for r in range(len(review_df)):
                         review_ws.set_row(r + 1, 60)
                         review_ws.write(r + 1, 0, review_df.iloc[r, 0], fmt_c1)
-                        review_ws.write(r + 1, 1, review_df.iloc[r, 1], fmt_l1)
+                        review_ws.write(r + 1, 1, review_df.iloc[r, 1], fmt_c1)
+                        for col_idx in range(2, 6):
+                            review_ws.write(r + 1, col_idx, review_df.iloc[r, col_idx], fmt_l1)
                         
             excel_data = output.getvalue()
             
@@ -976,4 +1652,39 @@ if uploaded_file is not None:
             mime=mime_type,
             use_container_width=True
         )
+
+        review_metadata = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "original_name": uploaded_file.name,
+            "file_ext": file_ext,
+            "selected_model": selected_model,
+            "knowledge": selected_kb_keyword,
+            "spelling_dicts": selected_sp_dicts,
+            "reference": selected_reference_name,
+            "lesson": selected_lesson_label,
+            "score_result": st.session_state.get("score_result"),
+            "correction_count": len(c_dict),
+            "corrections": c_dict,
+            "locations": loc_dict,
+            "correction_rows": correction_rows_for_history,
+            "alignment_report": st.session_state.get("alignment_report"),
+            "content_reviews": st.session_state.get("content_reviews") or [],
+            "content_review_context": st.session_state.get("content_review_context"),
+            "excel_name": f"교정결과_{uploaded_file.name}.xlsx",
+            "completed_name": download_name,
+            "completed_mime": mime_type,
+        }
+        saved_history_id = _save_review_history(
+            review_metadata,
+            excel_data=excel_data,
+            completed_data=download_data,
+        )
+        st.caption(f"검토 결과가 저장되었습니다. 사이드바 '검토 완료 문서'에서 다시 열 수 있습니다. (ID: {saved_history_id})")
+
+elif st.session_state.get("loaded_history_id"):
+    loaded_record = _load_review_history(st.session_state.loaded_history_id)
+    if loaded_record:
+        _render_saved_history_record(loaded_record)
+    else:
+        st.warning("저장된 검토 결과를 불러오지 못했습니다.")
 
