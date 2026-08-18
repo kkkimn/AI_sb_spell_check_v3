@@ -3,7 +3,8 @@ import json
 import base64
 import re
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import streamlit as st
 import pandas as pd
 from pptx import Presentation
@@ -47,6 +48,10 @@ st.title("✨AI 품질관리 시스템(원고, 스토리보드 검토)")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REVIEW_HISTORY_DIR = os.path.join(APP_DIR, "review_history")
+SUPABASE_HISTORY_TABLE = "review_history"
+SUPABASE_HISTORY_BUCKET = "review-history"
+_SUPABASE_CLIENT = None
+KST = ZoneInfo("Asia/Seoul")
 
 
 def _safe_filename(name):
@@ -73,7 +78,108 @@ def _write_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
 
 
-def _list_review_history(limit=None):
+def _now_kst():
+    return datetime.now(KST)
+
+
+def _now_kst_iso():
+    return _now_kst().isoformat(timespec="seconds")
+
+
+def _parse_datetime_value(value):
+    if not value:
+        return None
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=KST)
+        return dt.astimezone(KST)
+    except Exception:
+        return None
+
+
+def _history_sort_key(record):
+    dt = _parse_datetime_value(record.get("created_at"))
+    return dt or datetime.min.replace(tzinfo=KST)
+
+
+def _get_secret_value(key, default=""):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return os.environ.get(key, default)
+
+
+def _get_supabase_config():
+    return {
+        "url": _get_secret_value("SUPABASE_URL", ""),
+        "key": _get_secret_value("SUPABASE_SERVICE_ROLE_KEY", "") or _get_secret_value("SUPABASE_KEY", ""),
+        "bucket": _get_secret_value("SUPABASE_BUCKET", SUPABASE_HISTORY_BUCKET),
+        "table": _get_secret_value("SUPABASE_TABLE", SUPABASE_HISTORY_TABLE),
+    }
+
+
+def _get_supabase_client():
+    global _SUPABASE_CLIENT
+    config = _get_supabase_config()
+    if not config["url"] or not config["key"]:
+        return None
+    if _SUPABASE_CLIENT is not None:
+        return _SUPABASE_CLIENT
+    try:
+        from supabase import create_client
+        _SUPABASE_CLIENT = create_client(config["url"], config["key"])
+        return _SUPABASE_CLIENT
+    except Exception:
+        return None
+
+
+def _is_supabase_enabled():
+    return _get_supabase_client() is not None
+
+
+def _storage_path(history_id, file_name):
+    return f"{_safe_filename(history_id)}/{_safe_filename(file_name)}"
+
+
+def _upload_supabase_file(client, bucket, path, data, mime_type):
+    try:
+        return client.storage.from_(bucket).upload(
+            path,
+            data,
+            file_options={"content-type": mime_type, "upsert": "true"},
+        )
+    except Exception:
+        try:
+            client.storage.from_(bucket).remove([path])
+            return client.storage.from_(bucket).upload(
+                path,
+                data,
+                file_options={"content-type": mime_type, "upsert": "true"},
+            )
+        except Exception as e:
+            raise e
+
+
+def _download_supabase_file(path):
+    client = _get_supabase_client()
+    if client is None:
+        return None
+    try:
+        data = client.storage.from_(_get_supabase_config()["bucket"]).download(path)
+        if isinstance(data, bytes):
+            return data
+        if hasattr(data, "content"):
+            return data.content
+        return bytes(data)
+    except Exception:
+        return None
+
+
+def _list_review_history_local(limit=None):
     if not os.path.isdir(REVIEW_HISTORY_DIR):
         return []
 
@@ -88,15 +194,49 @@ def _list_review_history(limit=None):
             continue
         meta["history_id"] = entry
         meta["history_dir"] = record_dir
+        meta["storage_provider"] = "local"
         records.append(meta)
 
-    records.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    records.sort(key=_history_sort_key, reverse=True)
     if limit:
         return records[:limit]
     return records
 
 
-def _load_review_history(history_id):
+def _list_review_history_supabase(limit=None):
+    client = _get_supabase_client()
+    if client is None:
+        return []
+    table = _get_supabase_config()["table"]
+    try:
+        query = client.table(table).select("*").order("created_at", desc=True)
+        if limit:
+            query = query.limit(limit)
+        response = query.execute()
+    except Exception:
+        return []
+
+    records = []
+    for row in response.data or []:
+        metadata = row.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            continue
+        metadata["history_id"] = row.get("history_id") or metadata.get("history_id")
+        metadata["created_at"] = row.get("created_at") or metadata.get("created_at")
+        metadata["original_name"] = row.get("original_name") or metadata.get("original_name", "문서")
+        metadata["correction_count"] = row.get("correction_count", metadata.get("correction_count", 0))
+        metadata["storage_provider"] = "supabase"
+        records.append(metadata)
+    return records
+
+
+def _list_review_history(limit=None):
+    if _is_supabase_enabled():
+        return _list_review_history_supabase(limit)
+    return _list_review_history_local(limit)
+
+
+def _load_review_history_local(history_id):
     safe_id = _safe_filename(history_id)
     record_dir = os.path.join(REVIEW_HISTORY_DIR, safe_id)
     meta_path = os.path.join(record_dir, "metadata.json")
@@ -105,15 +245,50 @@ def _load_review_history(history_id):
         return None
     meta["history_id"] = safe_id
     meta["history_dir"] = record_dir
+    meta["storage_provider"] = "local"
     return meta
 
 
-def _save_review_history(metadata, excel_data=None, completed_data=None):
+def _load_review_history_supabase(history_id):
+    client = _get_supabase_client()
+    if client is None:
+        return None
+    try:
+        response = (
+            client.table(_get_supabase_config()["table"])
+            .select("*")
+            .eq("history_id", _safe_filename(history_id))
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return None
+    if not response.data:
+        return None
+    row = response.data[0]
+    metadata = row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return None
+    metadata["history_id"] = row.get("history_id") or _safe_filename(history_id)
+    metadata["created_at"] = row.get("created_at") or metadata.get("created_at")
+    metadata["original_name"] = row.get("original_name") or metadata.get("original_name", "문서")
+    metadata["correction_count"] = row.get("correction_count", metadata.get("correction_count", 0))
+    metadata["storage_provider"] = "supabase"
+    return metadata
+
+
+def _load_review_history(history_id):
+    if _is_supabase_enabled():
+        return _load_review_history_supabase(history_id)
+    return _load_review_history_local(history_id)
+
+
+def _save_review_history_local(metadata, excel_data=None, completed_data=None):
     os.makedirs(REVIEW_HISTORY_DIR, exist_ok=True)
 
     history_id = st.session_state.get("current_review_history_id")
     if not history_id:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = _now_kst().strftime("%Y%m%d_%H%M%S")
         name_part = os.path.splitext(_safe_filename(metadata.get("original_name", "문서")))[0][:40]
         history_id = f"{timestamp}_{name_part}"
         st.session_state.current_review_history_id = history_id
@@ -139,25 +314,93 @@ def _save_review_history(metadata, excel_data=None, completed_data=None):
 
     metadata["files"] = files
     metadata["history_id"] = history_id
-    metadata["saved_at"] = datetime.now().isoformat(timespec="seconds")
+    metadata["saved_at"] = _now_kst_iso()
     _write_json(os.path.join(record_dir, "metadata.json"), metadata)
     return history_id
+
+
+def _save_review_history_supabase(metadata, excel_data=None, completed_data=None):
+    client = _get_supabase_client()
+    if client is None:
+        return _save_review_history_local(metadata, excel_data, completed_data)
+
+    config = _get_supabase_config()
+    history_id = st.session_state.get("current_review_history_id")
+    if not history_id:
+        timestamp = _now_kst().strftime("%Y%m%d_%H%M%S")
+        name_part = os.path.splitext(_safe_filename(metadata.get("original_name", "문서")))[0][:40]
+        history_id = f"{timestamp}_{name_part}"
+        st.session_state.current_review_history_id = history_id
+    history_id = _safe_filename(history_id)
+
+    existing_metadata = _load_review_history_supabase(history_id)
+    if isinstance(existing_metadata, dict) and existing_metadata.get("created_at"):
+        metadata["created_at"] = existing_metadata["created_at"]
+
+    files = metadata.get("files", {})
+    if excel_data:
+        excel_name = _safe_filename(metadata.get("excel_name", "교정결과.xlsx"))
+        excel_path = _storage_path(history_id, excel_name)
+        _upload_supabase_file(
+            client,
+            config["bucket"],
+            excel_path,
+            excel_data,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        files["excel"] = excel_name
+        files["excel_path"] = excel_path
+
+    if completed_data:
+        completed_name = _safe_filename(metadata.get("completed_name", "완료본"))
+        completed_path = _storage_path(history_id, completed_name)
+        _upload_supabase_file(
+            client,
+            config["bucket"],
+            completed_path,
+            completed_data,
+            metadata.get("completed_mime", "application/octet-stream"),
+        )
+        files["completed"] = completed_name
+        files["completed_path"] = completed_path
+
+    metadata["files"] = files
+    metadata["history_id"] = history_id
+    metadata["storage_provider"] = "supabase"
+    metadata["saved_at"] = _now_kst_iso()
+
+    row = {
+        "history_id": history_id,
+        "created_at": metadata.get("created_at"),
+        "saved_at": metadata.get("saved_at"),
+        "original_name": metadata.get("original_name", "문서"),
+        "correction_count": metadata.get("correction_count", 0),
+        "metadata": metadata,
+    }
+    client.table(config["table"]).upsert(row, on_conflict="history_id").execute()
+    return history_id
+
+
+def _save_review_history(metadata, excel_data=None, completed_data=None):
+    if _is_supabase_enabled():
+        try:
+            return _save_review_history_supabase(metadata, excel_data, completed_data)
+        except Exception as e:
+            st.warning(f"Supabase 저장에 실패해 로컬에 임시 저장했습니다: {e}")
+    return _save_review_history_local(metadata, excel_data, completed_data)
 
 
 def _format_history_time(value):
     if not value:
         return ""
-    try:
-        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return value
+    dt = _parse_datetime_value(value)
+    if dt:
+        return dt.strftime("%Y-%m-%d %H:%M")
+    return value
 
 
 def _parse_history_datetime(value):
-    try:
-        return datetime.fromisoformat(value or "")
-    except Exception:
-        return None
+    return _parse_datetime_value(value)
 
 
 def _set_loaded_history(history_id):
@@ -173,7 +416,7 @@ def _set_loaded_history(history_id):
     st.session_state.current_review_history_id = None
 
 
-def _delete_review_history(history_id):
+def _delete_review_history_local(history_id):
     safe_id = _safe_filename(history_id)
     record_dir = os.path.abspath(os.path.join(REVIEW_HISTORY_DIR, safe_id))
     history_root = os.path.abspath(REVIEW_HISTORY_DIR)
@@ -185,6 +428,31 @@ def _delete_review_history(history_id):
             st.session_state.loaded_history_id = None
         return True
     return False
+
+
+def _delete_review_history_supabase(history_id):
+    client = _get_supabase_client()
+    if client is None:
+        return False
+    safe_id = _safe_filename(history_id)
+    record = _load_review_history_supabase(safe_id)
+    files = (record or {}).get("files") or {}
+    paths = [path for path in [files.get("excel_path"), files.get("completed_path")] if path]
+    try:
+        if paths:
+            client.storage.from_(_get_supabase_config()["bucket"]).remove(paths)
+        client.table(_get_supabase_config()["table"]).delete().eq("history_id", safe_id).execute()
+        if st.session_state.get("loaded_history_id") == safe_id:
+            st.session_state.loaded_history_id = None
+        return True
+    except Exception:
+        return False
+
+
+def _delete_review_history(history_id):
+    if _is_supabase_enabled():
+        return _delete_review_history_supabase(history_id)
+    return _delete_review_history_local(history_id)
 
 
 def _filter_history_records(records, search_text, period_option, start_date=None, end_date=None):
@@ -199,28 +467,28 @@ def _filter_history_records(records, search_text, period_option, start_date=None
             or query in record.get("knowledge", "").lower()
         ]
 
-    now = datetime.now()
+    now = _now_kst()
     if period_option == "오늘":
-        start_dt = datetime(now.year, now.month, now.day)
+        start_dt = datetime(now.year, now.month, now.day, tzinfo=KST)
         filtered = [
             record for record in filtered
             if (dt := _parse_history_datetime(record.get("created_at"))) and dt >= start_dt
         ]
     elif period_option == "최근 7일":
-        start_dt = now - pd.Timedelta(days=7)
+        start_dt = now - timedelta(days=7)
         filtered = [
             record for record in filtered
             if (dt := _parse_history_datetime(record.get("created_at"))) and dt >= start_dt
         ]
     elif period_option == "최근 30일":
-        start_dt = now - pd.Timedelta(days=30)
+        start_dt = now - timedelta(days=30)
         filtered = [
             record for record in filtered
             if (dt := _parse_history_datetime(record.get("created_at"))) and dt >= start_dt
         ]
     elif period_option == "직접 지정" and start_date and end_date:
-        start_dt = datetime.combine(start_date, datetime.min.time())
-        end_dt = datetime.combine(end_date, datetime.max.time())
+        start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=KST)
+        end_dt = datetime.combine(end_date, datetime.max.time(), tzinfo=KST)
         filtered = [
             record for record in filtered
             if (dt := _parse_history_datetime(record.get("created_at"))) and start_dt <= dt <= end_dt
@@ -231,12 +499,12 @@ def _filter_history_records(records, search_text, period_option, start_date=None
 
 def _sort_history_records(records, sort_option):
     if sort_option == "오래된순":
-        return sorted(records, key=lambda item: item.get("created_at", ""))
+        return sorted(records, key=_history_sort_key)
     if sort_option == "오류 많은 순":
         return sorted(records, key=lambda item: item.get("correction_count", 0), reverse=True)
     if sort_option == "파일명순":
         return sorted(records, key=lambda item: item.get("original_name", ""))
-    return sorted(records, key=lambda item: item.get("created_at", ""), reverse=True)
+    return sorted(records, key=_history_sort_key, reverse=True)
 
 
 def _render_history_manager_content():
@@ -310,7 +578,6 @@ def _render_history_manager_content():
             st.caption(f"오류 {error_count}건 · 지식: {knowledge} · 강의계획서: {reference}")
             if st.button("이 검토 결과 열기", key=f"manager_load_{record['history_id']}", use_container_width=True):
                 _set_loaded_history(record["history_id"])
-                st.session_state.show_history_manager = False
                 st.rerun()
         with row_delete:
             if st.button("삭제", key=f"manager_delete_{record['history_id']}", disabled=not delete_enabled, use_container_width=True):
@@ -331,7 +598,6 @@ def _show_history_manager():
         @dialog_decorator
         def _history_dialog():
             if st.button("닫기", key="close_history_dialog"):
-                st.session_state.show_history_manager = False
                 st.rerun()
             _render_history_manager_content()
 
@@ -339,7 +605,6 @@ def _show_history_manager():
     else:
         with st.expander("검토 기록 전체 보기", expanded=True):
             if st.button("닫기", key="close_history_panel"):
-                st.session_state.show_history_manager = False
                 st.rerun()
             _render_history_manager_content()
 
@@ -429,27 +694,39 @@ def _render_saved_history_record(record):
         excel_file = files.get("excel")
         completed_file = files.get("completed")
         if excel_file:
-            excel_path = os.path.join(record_dir, excel_file)
-            if os.path.exists(excel_path):
-                with open(excel_path, "rb") as f:
-                    col_excel.download_button(
-                        "📊 교정 결과 엑셀 다운로드",
-                        data=f.read(),
-                        file_name=excel_file,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
+            excel_data = None
+            if record.get("storage_provider") == "supabase" and files.get("excel_path"):
+                excel_data = _download_supabase_file(files["excel_path"])
+            else:
+                excel_path = os.path.join(record_dir, excel_file)
+                if os.path.exists(excel_path):
+                    with open(excel_path, "rb") as f:
+                        excel_data = f.read()
+            if excel_data:
+                col_excel.download_button(
+                    "📊 교정 결과 엑셀 다운로드",
+                    data=excel_data,
+                    file_name=excel_file,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
         if completed_file:
-            completed_path = os.path.join(record_dir, completed_file)
-            if os.path.exists(completed_path):
-                with open(completed_path, "rb") as f:
-                    col_completed.download_button(
-                        "💖 저장된 완성본 다운로드",
-                        data=f.read(),
-                        file_name=completed_file,
-                        mime=record.get("completed_mime", "application/octet-stream"),
-                        use_container_width=True,
-                    )
+            completed_data = None
+            if record.get("storage_provider") == "supabase" and files.get("completed_path"):
+                completed_data = _download_supabase_file(files["completed_path"])
+            else:
+                completed_path = os.path.join(record_dir, completed_file)
+                if os.path.exists(completed_path):
+                    with open(completed_path, "rb") as f:
+                        completed_data = f.read()
+            if completed_data:
+                col_completed.download_button(
+                    "💖 저장된 완성본 다운로드",
+                    data=completed_data,
+                    file_name=completed_file,
+                    mime=record.get("completed_mime", "application/octet-stream"),
+                    use_container_width=True,
+                )
 
 
 # 로고 (사이드바 열림/닫힘 모두 표시)
@@ -501,9 +778,11 @@ if os.path.exists(_logo_path):
 
 with st.sidebar:
     selected_model = "gpt-5.6-sol"
+    open_history_manager = False
 
     st.divider()
     st.subheader("📚 검토 완료 문서")
+    st.caption("저장 위치: Supabase 공동 저장소" if _is_supabase_enabled() else "저장 위치: 로컬 폴더")
     history_records = _list_review_history()
     if history_records:
         for record in history_records[:5]:
@@ -515,7 +794,7 @@ with st.sidebar:
                 _set_loaded_history(record["history_id"])
                 st.rerun()
         if st.button("📂 리스트 전체 보기", use_container_width=True):
-            st.session_state.show_history_manager = True
+            open_history_manager = True
     else:
         st.caption("아직 저장된 검토 결과가 없습니다.")
 
@@ -1020,6 +1299,9 @@ def render_grade_legend():
 
 # 메인 영역
 if st.session_state.get("show_history_manager"):
+    st.session_state.show_history_manager = False
+
+if open_history_manager:
     _show_history_manager()
 
 st.markdown(
@@ -1654,7 +1936,7 @@ if uploaded_file is not None:
         )
 
         review_metadata = {
-            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "created_at": _now_kst_iso(),
             "original_name": uploaded_file.name,
             "file_ext": file_ext,
             "selected_model": selected_model,

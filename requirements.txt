@@ -11,3 +11,4 @@ python-dotenv
 PyMuPDF
 olefile
 python-docx
+supabase
