@@ -3,6 +3,7 @@ import json
 import base64
 import re
 import shutil
+import hashlib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import streamlit as st
@@ -51,12 +52,23 @@ REVIEW_HISTORY_DIR = os.path.join(APP_DIR, "review_history")
 SUPABASE_HISTORY_TABLE = "review_history"
 SUPABASE_HISTORY_BUCKET = "review-history"
 _SUPABASE_CLIENT = None
+_SUPABASE_ERROR = ""
 KST = ZoneInfo("Asia/Seoul")
 
 
 def _safe_filename(name):
     base = os.path.basename(name or "문서")
     return re.sub(r'[\\/:*?"<>|]+', "_", base).strip() or "문서"
+
+
+def _safe_storage_segment(value, fallback="file"):
+    text = str(value or fallback)
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
+    digest = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    if cleaned:
+        cleaned = cleaned[:80]
+        return f"{digest}_{cleaned}"
+    return digest or fallback
 
 
 def _json_default(value):
@@ -123,17 +135,28 @@ def _get_supabase_config():
 
 
 def _get_supabase_client():
-    global _SUPABASE_CLIENT
+    global _SUPABASE_CLIENT, _SUPABASE_ERROR
     config = _get_supabase_config()
     if not config["url"] or not config["key"]:
+        missing = []
+        if not config["url"]:
+            missing.append("SUPABASE_URL")
+        if not config["key"]:
+            missing.append("SUPABASE_SERVICE_ROLE_KEY")
+        _SUPABASE_ERROR = f"Secrets에 {', '.join(missing)} 값이 없습니다."
         return None
     if _SUPABASE_CLIENT is not None:
         return _SUPABASE_CLIENT
     try:
         from supabase import create_client
         _SUPABASE_CLIENT = create_client(config["url"], config["key"])
+        _SUPABASE_ERROR = ""
         return _SUPABASE_CLIENT
-    except Exception:
+    except ImportError:
+        _SUPABASE_ERROR = "requirements.txt에 supabase가 설치되지 않았거나 배포가 다시 빌드되지 않았습니다."
+        return None
+    except Exception as e:
+        _SUPABASE_ERROR = f"Supabase 연결 실패: {e}"
         return None
 
 
@@ -141,8 +164,16 @@ def _is_supabase_enabled():
     return _get_supabase_client() is not None
 
 
+def _supabase_status_message():
+    if _is_supabase_enabled():
+        return "저장 위치: Supabase 공동 저장소"
+    return f"저장 위치: 로컬 폴더 (임시 저장) · {_SUPABASE_ERROR}"
+
+
 def _storage_path(history_id, file_name):
-    return f"{_safe_filename(history_id)}/{_safe_filename(file_name)}"
+    folder = _safe_storage_segment(history_id, "history")
+    name = _safe_storage_segment(file_name, "file")
+    return f"{folder}/{name}"
 
 
 def _upload_supabase_file(client, bucket, path, data, mime_type):
@@ -782,7 +813,14 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📚 검토 완료 문서")
-    st.caption("저장 위치: Supabase 공동 저장소" if _is_supabase_enabled() else "저장 위치: 로컬 폴더")
+    if _is_supabase_enabled():
+        st.caption(_supabase_status_message())
+    else:
+        st.warning(
+            _supabase_status_message()
+            + "\n\nStreamlit 웹 배포에서 로컬 폴더는 재시작/재배포 시 사라질 수 있습니다. "
+            + "검토 리스트를 계속 남기려면 Supabase Secrets 설정이 필요합니다."
+        )
     history_records = _list_review_history()
     if history_records:
         for record in history_records[:5]:
