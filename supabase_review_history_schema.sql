@@ -16,3 +16,9 @@ create index if not exists review_history_original_name_idx
 insert into storage.buckets (id, name, public)
 values ('review-history', 'review-history', false)
 on conflict (id) do nothing;
+
+create table if not exists public.app_settings (
+  setting_key text primary key,
+  value jsonb not null,
+  saved_at timestamptz not null
+);

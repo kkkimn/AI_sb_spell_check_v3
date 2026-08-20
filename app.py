@@ -51,6 +51,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REVIEW_HISTORY_DIR = os.path.join(APP_DIR, "review_history")
 SUPABASE_HISTORY_TABLE = "review_history"
 SUPABASE_HISTORY_BUCKET = "review-history"
+SUPABASE_SETTINGS_TABLE = "app_settings"
 _SUPABASE_CLIENT = None
 _SUPABASE_ERROR = ""
 KST = ZoneInfo("Asia/Seoul")
@@ -131,6 +132,7 @@ def _get_supabase_config():
         "key": _get_secret_value("SUPABASE_SERVICE_ROLE_KEY", "") or _get_secret_value("SUPABASE_KEY", ""),
         "bucket": _get_secret_value("SUPABASE_BUCKET", SUPABASE_HISTORY_BUCKET),
         "table": _get_secret_value("SUPABASE_TABLE", SUPABASE_HISTORY_TABLE),
+        "settings_table": _get_secret_value("SUPABASE_SETTINGS_TABLE", SUPABASE_SETTINGS_TABLE),
     }
 
 
@@ -419,6 +421,69 @@ def _save_review_history(metadata, excel_data=None, completed_data=None):
         except Exception as e:
             st.warning(f"Supabase 저장에 실패해 로컬에 임시 저장했습니다: {e}")
     return _save_review_history_local(metadata, excel_data, completed_data)
+
+
+def _load_persistent_json(setting_key, local_path, default=None):
+    if default is None:
+        default = {}
+
+    client = _get_supabase_client()
+    if client is not None:
+        try:
+            response = (
+                client.table(_get_supabase_config()["settings_table"])
+                .select("value")
+                .eq("setting_key", setting_key)
+                .limit(1)
+                .execute()
+            )
+            if response.data:
+                value = response.data[0].get("value")
+                if isinstance(value, type(default)):
+                    return value
+                if isinstance(default, dict) and isinstance(value, dict):
+                    return value
+                if isinstance(default, list) and isinstance(value, list):
+                    return value
+        except Exception as e:
+            st.warning(f"Supabase 설정 데이터 불러오기 실패({setting_key}): {e}")
+
+    loaded = _read_json(local_path, default)
+    if not isinstance(loaded, type(default)):
+        return default
+
+    if client is not None and loaded:
+        try:
+            client.table(_get_supabase_config()["settings_table"]).upsert(
+                {
+                    "setting_key": setting_key,
+                    "value": loaded,
+                    "saved_at": _now_kst_iso(),
+                },
+                on_conflict="setting_key",
+            ).execute()
+        except Exception:
+            pass
+
+    return loaded
+
+
+def _save_persistent_json(setting_key, local_path, data):
+    client = _get_supabase_client()
+    if client is not None:
+        try:
+            client.table(_get_supabase_config()["settings_table"]).upsert(
+                {
+                    "setting_key": setting_key,
+                    "value": data,
+                    "saved_at": _now_kst_iso(),
+                },
+                on_conflict="setting_key",
+            ).execute()
+        except Exception as e:
+            st.warning(f"Supabase 설정 데이터 저장 실패({setting_key}). 로컬에 임시 저장합니다: {e}")
+
+    _write_json(local_path, data)
 
 
 def _format_history_time(value):
@@ -845,13 +910,10 @@ with st.sidebar:
     st.subheader("🧠 AI 사전 학습 (지식 베이스)")
     
     kb_file_path = "knowledge_base.json"
-    knowledge_base = {}
-    if os.path.exists(kb_file_path):
-        with open(kb_file_path, "r", encoding="utf-8") as f:
-            try:
-                knowledge_base = json.load(f)
-            except Exception:
-                pass
+    knowledge_base = _load_persistent_json("knowledge_base", kb_file_path, {})
+
+    def _save_knowledge_base(data):
+        _save_persistent_json("knowledge_base", kb_file_path, data)
                 
     new_keyword = st.text_input("학습할 주제/키워드 명 (예: 소형무인기논문)", placeholder="키워드 입력")
     kb_file = st.file_uploader("학습할 문서 업로드 (선택, PPTX/PDF/TXT/DOCX)", type=["pptx", "pdf", "txt", "docx"])
@@ -902,8 +964,7 @@ with st.sidebar:
                     
                 if kb_data:
                     knowledge_base[target_keyword] = kb_data
-                    with open(kb_file_path, "w", encoding="utf-8") as f:
-                        json.dump(knowledge_base, f, ensure_ascii=False, indent=2)
+                    _save_knowledge_base(knowledge_base)
                     st.success(f"'{target_keyword}' 학습 완료 및 저장됨!")
                 else:
                     if kb_file and file_text.strip():
@@ -921,8 +982,7 @@ with st.sidebar:
                         if st.button("💾", key=f"save_{kw}", help="저장", type="tertiary"):
                             if new_name and new_name != kw:
                                 knowledge_base[new_name] = knowledge_base.pop(kw)
-                                with open(kb_file_path, "w", encoding="utf-8") as f:
-                                    json.dump(knowledge_base, f, ensure_ascii=False, indent=2)
+                                _save_knowledge_base(knowledge_base)
                             st.session_state[f"edit_mode_{kw}"] = False
                             st.rerun()
                     with col_s3:
@@ -940,27 +1000,17 @@ with st.sidebar:
                     with col3:
                         if st.button("🗑️", key=f"del_{kw}", help=f"'{kw}' 지식 삭제", type="tertiary"):
                             del knowledge_base[kw]
-                            with open(kb_file_path, "w", encoding="utf-8") as f:
-                                json.dump(knowledge_base, f, ensure_ascii=False, indent=2)
+                            _save_knowledge_base(knowledge_base)
                             st.rerun()
 
     st.divider()
     st.subheader("📘 강의계획서 관리")
 
     reference_documents_path = "reference_documents.json"
-    reference_documents = {}
-    if os.path.exists(reference_documents_path):
-        with open(reference_documents_path, "r", encoding="utf-8") as f:
-            try:
-                loaded_reference_documents = json.load(f)
-                if isinstance(loaded_reference_documents, dict):
-                    reference_documents = loaded_reference_documents
-            except Exception:
-                pass
+    reference_documents = _load_persistent_json("reference_documents", reference_documents_path, {})
 
     def _save_reference_documents(documents):
-        with open(reference_documents_path, "w", encoding="utf-8") as f:
-            json.dump(documents, f, ensure_ascii=False, indent=2)
+        _save_persistent_json("reference_documents", reference_documents_path, documents)
 
     new_reference_name = st.text_input(
         "강의계획서 이름",
@@ -1045,11 +1095,10 @@ with st.sidebar:
     st.subheader("📖 사용자 맞춤법 사전")
     
     sp_dict_file_path = "custom_spelling_dicts.json"
-    spelling_dicts = {}
+    spelling_dicts = _load_persistent_json("custom_spelling_dicts", sp_dict_file_path, {})
     
     def _save_all_spelling_dicts(dicts_to_save):
-        with open(sp_dict_file_path, "w", encoding="utf-8") as f:
-            json.dump(dicts_to_save, f, ensure_ascii=False, indent=2)
+        _save_persistent_json("custom_spelling_dicts", sp_dict_file_path, dicts_to_save)
         # 하위 호환성을 위해 모든 사전의 단어를 맞춤법사전.txt에 통합 저장
         all_words = []
         for words in dicts_to_save.values():
@@ -1059,13 +1108,7 @@ with st.sidebar:
             f.write("\n".join(unique_words))
 
     # 데이터 로드 및 마이그레이션
-    if os.path.exists(sp_dict_file_path):
-        with open(sp_dict_file_path, "r", encoding="utf-8") as f:
-            try:
-                spelling_dicts = json.load(f)
-            except Exception:
-                pass
-    else:
+    if not spelling_dicts:
         # 기존 맞춤법사전.txt가 있으면 가져와서 '기본 사전'으로 마이그레이션
         old_dict_path = "맞춤법사전.txt"
         if os.path.exists(old_dict_path):
