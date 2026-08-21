@@ -720,7 +720,9 @@ def _render_history_manager_content():
             unsafe_allow_html=True,
         )
     with nav_col4:
-        delete_enabled = st.checkbox("삭제 활성화", key="history_delete_enabled")
+        st.checkbox("삭제 활성화", key="history_delete_enabled")
+
+    delete_enabled = bool(st.session_state.get("history_delete_enabled", False))
 
     start_idx = (current_page - 1) * page_size
     page_records = filtered_records[start_idx:start_idx + page_size]
