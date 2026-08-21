@@ -4,6 +4,7 @@ import base64
 import re
 import shutil
 import hashlib
+import html
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import streamlit as st
@@ -628,7 +629,46 @@ def _sort_history_records(records, sort_option):
 
 def _render_history_manager_content():
     records = _list_review_history()
-    st.caption(f"전체 저장 기록 {len(records)}개")
+    st.markdown(
+        """
+        <style>
+        .history-summary {
+            color: #667085;
+            font-size: 0.88rem;
+            margin: -0.25rem 0 0.85rem 0;
+        }
+        .history-list-item {
+            border: 1px solid #e6eaf0;
+            border-radius: 8px;
+            padding: 0.75rem 0.85rem;
+            margin: 0.55rem 0 0.35rem 0;
+            background: #ffffff;
+        }
+        .history-list-title {
+            color: #101828;
+            font-size: 0.96rem;
+            font-weight: 700;
+            line-height: 1.35;
+            margin-bottom: 0.35rem;
+            word-break: keep-all;
+            overflow-wrap: anywhere;
+        }
+        .history-list-meta {
+            color: #667085;
+            font-size: 0.82rem;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+        }
+        .history-page-caption {
+            color: #667085;
+            font-size: 0.84rem;
+            padding-top: 0.45rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(f'<div class="history-summary">전체 저장 기록 {len(records):,}개</div>', unsafe_allow_html=True)
 
     search_text = st.text_input("검색", placeholder="파일명, 지식명, 강의계획서명으로 검색", key="history_search_text")
     col_period, col_sort, col_page_size = st.columns([1.2, 1, 0.8])
@@ -673,7 +713,10 @@ def _render_history_manager_content():
             st.session_state.history_page = min(total_pages, current_page + 1)
             st.rerun()
     with nav_col3:
-        st.caption(f"{current_page} / {total_pages} 페이지 · 검색 결과 {len(filtered_records)}개")
+        st.markdown(
+            f'<div class="history-page-caption">{current_page} / {total_pages} 페이지 · 검색 결과 {len(filtered_records):,}개</div>',
+            unsafe_allow_html=True,
+        )
     with nav_col4:
         delete_enabled = st.checkbox("삭제 활성화", key="history_delete_enabled")
 
@@ -690,11 +733,22 @@ def _render_history_manager_content():
         error_count = record.get("correction_count", 0)
         reference = record.get("reference", "사용 안함")
         knowledge = record.get("knowledge", "선택 안함")
+        display_title = html.escape(str(title))
+        display_created = html.escape(str(created))
+        display_reference = html.escape(str(reference))
+        display_knowledge = html.escape(str(knowledge))
 
+        st.markdown(
+            f"""
+            <div class="history-list-item">
+                <div class="history-list-title">{display_created} · {display_title}</div>
+                <div class="history-list-meta">오류 {error_count}건 · 지식: {display_knowledge} · 강의계획서: {display_reference}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         row_view, row_delete = st.columns([4, 1])
         with row_view:
-            st.markdown(f"**{created} · {title}**")
-            st.caption(f"오류 {error_count}건 · 지식: {knowledge} · 강의계획서: {reference}")
             if st.button("이 검토 결과 열기", key=f"manager_load_{record['history_id']}", use_container_width=True):
                 _set_loaded_history(record["history_id"])
                 st.rerun()
@@ -901,15 +955,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📚 검토 완료 문서")
-    if _is_supabase_enabled():
-        st.caption(_supabase_status_message())
-    else:
-        st.warning(
-            _supabase_status_message()
-            + "\n\nStreamlit 웹 배포에서 로컬 폴더는 재시작/재배포 시 사라질 수 있습니다. "
-            + "검토 리스트를 계속 남기려면 Supabase Secrets 설정이 필요합니다."
-        )
     history_records = _list_review_history()
+    st.caption(f"총 {len(history_records):,}개 저장됨")
     if history_records:
         for record in history_records[:5]:
             title = record.get("original_name", "문서")
