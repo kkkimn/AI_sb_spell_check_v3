@@ -272,7 +272,21 @@ def _list_review_history_supabase(limit=None):
 
 def _list_review_history(limit=None):
     if _is_supabase_enabled():
-        return _list_review_history_supabase(limit)
+        records_by_id = {}
+        for record in _list_review_history_local():
+            history_id = record.get("history_id")
+            if history_id:
+                records_by_id[history_id] = record
+        for record in _list_review_history_supabase():
+            history_id = record.get("history_id")
+            if history_id:
+                records_by_id[history_id] = record
+
+        records = sorted(records_by_id.values(), key=_history_sort_key, reverse=True)
+        if limit:
+            return records[:limit]
+        return records
+
     return _list_review_history_local(limit)
 
 
@@ -319,7 +333,7 @@ def _load_review_history_supabase(history_id):
 
 def _load_review_history(history_id):
     if _is_supabase_enabled():
-        return _load_review_history_supabase(history_id)
+        return _load_review_history_supabase(history_id) or _load_review_history_local(history_id)
     return _load_review_history_local(history_id)
 
 
@@ -554,7 +568,9 @@ def _delete_review_history_supabase(history_id):
 
 def _delete_review_history(history_id):
     if _is_supabase_enabled():
-        return _delete_review_history_supabase(history_id)
+        deleted_supabase = _delete_review_history_supabase(history_id)
+        deleted_local = _delete_review_history_local(history_id)
+        return deleted_supabase or deleted_local
     return _delete_review_history_local(history_id)
 
 
@@ -1972,56 +1988,67 @@ if uploaded_file is not None:
             
         st.subheader("📥 3. 완성본 다운로드")
         
-        with st.spinner("수정 및 덧그리기 작업 중입니다..."):
-            out_stream = io.BytesIO()
-            if file_ext == '.pdf':
-                core.apply_corrections_to_pdf(doc_obj, st.session_state.corrections)
-                doc_obj.save(out_stream)
-                doc_obj.close()
-                mime_type = "application/pdf"
-                btn_label = "💖 교정 하이라이트 PDF 다운로드"
-                download_name = f"완료_{uploaded_file.name}"
-            elif file_ext == '.pptx':
-                core.apply_corrections_to_ppt(doc_obj, st.session_state.corrections)
-                doc_obj.save(out_stream)
-                mime_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                btn_label = "💖 핑크색 교정 반영본 PPTX 다운로드"
-                download_name = f"완료_{uploaded_file.name}"
-            elif file_ext == '.docx':
-                core.apply_corrections_to_docx(doc_obj, st.session_state.corrections)
-                doc_obj.save(out_stream)
-                mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                btn_label = "💖 핑크색 교정 반영본 DOCX 다운로드"
-                download_name = f"완료_{uploaded_file.name}"
-            elif file_ext in ('.hwp', '.hwpx'):
-                try:
-                    full_txt = st.session_state.full_text or ""
-                    corrections = st.session_state.corrections or {}
-                    # 한글 본문 텍스트와 교정 사전을 바탕으로 Word 문서(.docx) 생성
-                    docx_doc = core.create_docx_from_hwp_text(full_txt, corrections)
-                    docx_doc.save(out_stream)
+        download_data = None
+        completion_error = None
+        mime_type = "application/octet-stream"
+        btn_label = "💖 교정 반영본 다운로드"
+        download_name = f"완료_{uploaded_file.name}"
+
+        try:
+            with st.spinner("수정 및 덧그리기 작업 중입니다..."):
+                out_stream = io.BytesIO()
+                if file_ext == '.pdf':
+                    core.apply_corrections_to_pdf(doc_obj, st.session_state.corrections)
+                    doc_obj.save(out_stream)
+                    doc_obj.close()
+                    mime_type = "application/pdf"
+                    btn_label = "💖 교정 하이라이트 PDF 다운로드"
+                    download_name = f"완료_{uploaded_file.name}"
+                elif file_ext == '.pptx':
+                    core.apply_corrections_to_ppt(doc_obj, st.session_state.corrections)
+                    doc_obj.save(out_stream)
+                    mime_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                    btn_label = "💖 핑크색 교정 반영본 PPTX 다운로드"
+                    download_name = f"완료_{uploaded_file.name}"
+                elif file_ext == '.docx':
+                    core.apply_corrections_to_docx(doc_obj, st.session_state.corrections)
+                    doc_obj.save(out_stream)
                     mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    btn_label = "💖 워드(.docx)로 변환된 교정 반영본 다운로드"
-                    base_name = os.path.splitext(uploaded_file.name)[0]
-                    download_name = f"완료_{base_name}.docx"
-                except Exception as e:
-                    # 예외 발생 시 최종 백업으로 텍스트 파일 제공
-                    corrected_text = core.apply_corrections_to_text(st.session_state.full_text or "", st.session_state.corrections or {})
-                    out_stream.write(corrected_text.encode('utf-8'))
-                    mime_type = "text/plain"
-                    btn_label = "💖 교정 반영본 텍스트 파일(TXT) 다운로드 (대체)"
-                    base_name = os.path.splitext(uploaded_file.name)[0]
-                    download_name = f"완료_{base_name}.txt"
-                
-            download_data = out_stream.getvalue()
-            
-        st.download_button(
-            label=btn_label,
-            data=download_data,
-            file_name=download_name,
-            mime=mime_type,
-            use_container_width=True
-        )
+                    btn_label = "💖 핑크색 교정 반영본 DOCX 다운로드"
+                    download_name = f"완료_{uploaded_file.name}"
+                elif file_ext in ('.hwp', '.hwpx'):
+                    try:
+                        full_txt = st.session_state.full_text or ""
+                        corrections = st.session_state.corrections or {}
+                        # 한글 본문 텍스트와 교정 사전을 바탕으로 Word 문서(.docx) 생성
+                        docx_doc = core.create_docx_from_hwp_text(full_txt, corrections)
+                        docx_doc.save(out_stream)
+                        mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        btn_label = "💖 워드(.docx)로 변환된 교정 반영본 다운로드"
+                        base_name = os.path.splitext(uploaded_file.name)[0]
+                        download_name = f"완료_{base_name}.docx"
+                    except Exception:
+                        # 예외 발생 시 최종 백업으로 텍스트 파일 제공
+                        corrected_text = core.apply_corrections_to_text(st.session_state.full_text or "", st.session_state.corrections or {})
+                        out_stream.write(corrected_text.encode('utf-8'))
+                        mime_type = "text/plain"
+                        btn_label = "💖 교정 반영본 텍스트 파일(TXT) 다운로드 (대체)"
+                        base_name = os.path.splitext(uploaded_file.name)[0]
+                        download_name = f"완료_{base_name}.txt"
+
+                download_data = out_stream.getvalue()
+        except Exception as e:
+            completion_error = str(e)
+            st.error(f"완성본 파일 생성 중 오류가 발생했습니다. 검토 기록은 저장을 시도합니다: {completion_error}")
+
+        if download_data:
+            st.download_button(
+                label=btn_label,
+                data=download_data,
+                file_name=download_name,
+                mime=mime_type,
+                use_container_width=True
+            )
 
         review_metadata = {
             "created_at": _now_kst_iso(),
@@ -2043,6 +2070,7 @@ if uploaded_file is not None:
             "excel_name": f"교정결과_{uploaded_file.name}.xlsx",
             "completed_name": download_name,
             "completed_mime": mime_type,
+            "completed_error": completion_error,
         }
         saved_history_id = _save_review_history(
             review_metadata,
