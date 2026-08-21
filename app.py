@@ -40,6 +40,13 @@ st.markdown(
     [data-testid="stHeader"] {
         height: 2.5rem !important;
     }
+    [data-testid="stSidebar"] {
+        width: 31.5rem !important;
+        min-width: 31.5rem !important;
+    }
+    [data-testid="stSidebar"] > div:first-child {
+        width: 31.5rem !important;
+    }
     </style>
     """,
     unsafe_allow_html=True
