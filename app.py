@@ -640,8 +640,8 @@ def _render_history_manager_content():
         .history-list-item {
             border: 1px solid #e6eaf0;
             border-radius: 8px;
-            padding: 0.75rem 0.85rem;
-            margin: 0.55rem 0 0.35rem 0;
+            padding: 0.45rem 0.65rem;
+            margin: 0.5rem 0 0.25rem 0;
             background: #ffffff;
         }
         .history-list-title {
@@ -649,7 +649,7 @@ def _render_history_manager_content():
             font-size: 0.96rem;
             font-weight: 700;
             line-height: 1.35;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.25rem;
             word-break: keep-all;
             overflow-wrap: anywhere;
         }
@@ -738,27 +738,29 @@ def _render_history_manager_content():
         display_reference = html.escape(str(reference))
         display_knowledge = html.escape(str(knowledge))
 
-        st.markdown(
-            f"""
-            <div class="history-list-item">
-                <div class="history-list-title">{display_created} · {display_title}</div>
-                <div class="history-list-meta">오류 {error_count}건 · 지식: {display_knowledge} · 강의계획서: {display_reference}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        row_view, row_delete = st.columns([4, 1])
-        with row_view:
-            if st.button("이 검토 결과 열기", key=f"manager_load_{record['history_id']}", use_container_width=True):
-                _set_loaded_history(record["history_id"])
-                st.rerun()
-        with row_delete:
-            if st.button("삭제", key=f"manager_delete_{record['history_id']}", disabled=not delete_enabled, use_container_width=True):
-                if _delete_review_history(record["history_id"]):
-                    st.success("삭제되었습니다.")
+        with st.container():
+            st.markdown('<div class="history-list-item">', unsafe_allow_html=True)
+            row_info, row_view, row_delete = st.columns([5.2, 1.35, 0.9], vertical_alignment="center")
+            with row_info:
+                st.markdown(
+                    f"""
+                    <div class="history-list-title">{display_created} · {display_title}</div>
+                    <div class="history-list-meta">오류 {error_count}건 · 지식: {display_knowledge} · 강의계획서: {display_reference}</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with row_view:
+                if st.button("열기", key=f"manager_load_{record['history_id']}", use_container_width=True):
+                    _set_loaded_history(record["history_id"])
                     st.rerun()
-                else:
-                    st.error("삭제하지 못했습니다.")
+            with row_delete:
+                if st.button("삭제", key=f"manager_delete_{record['history_id']}", disabled=not delete_enabled, use_container_width=True):
+                    if _delete_review_history(record["history_id"]):
+                        st.success("삭제되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error("삭제하지 못했습니다.")
+            st.markdown('</div>', unsafe_allow_html=True)
 
 
 def _show_history_manager():
