@@ -732,7 +732,13 @@ def _render_history_manager_content():
             unsafe_allow_html=True,
         )
     with nav_col4:
-        if st.button(f"선택 삭제 ({len(selected_history_ids)})", disabled=not selected_history_ids, key="history_delete_selected", use_container_width=True):
+        if st.button(
+            f"선택 삭제 ({len(selected_history_ids)})",
+            disabled=not selected_history_ids,
+            key="history_delete_selected",
+            type="primary",
+            use_container_width=True,
+        ):
             deleted_count = 0
             failed_count = 0
             for history_id in selected_history_ids:
