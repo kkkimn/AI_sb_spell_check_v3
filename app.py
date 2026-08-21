@@ -707,10 +707,12 @@ def _render_history_manager_content():
     with nav_col1:
         if st.button("이전", disabled=current_page <= 1, key="history_prev_page"):
             st.session_state.history_page = max(1, current_page - 1)
+            st.session_state.show_history_manager = True
             st.rerun()
     with nav_col2:
         if st.button("다음", disabled=current_page >= total_pages, key="history_next_page"):
             st.session_state.history_page = min(total_pages, current_page + 1)
+            st.session_state.show_history_manager = True
             st.rerun()
     with nav_col3:
         st.markdown(
@@ -751,12 +753,14 @@ def _render_history_manager_content():
                 )
             with row_view:
                 if st.button("열기", key=f"manager_load_{record['history_id']}", use_container_width=True):
+                    st.session_state.show_history_manager = False
                     _set_loaded_history(record["history_id"])
                     st.rerun()
             with row_delete:
                 if st.button("삭제", key=f"manager_delete_{record['history_id']}", disabled=not delete_enabled, use_container_width=True):
                     if _delete_review_history(record["history_id"]):
                         st.success("삭제되었습니다.")
+                        st.session_state.show_history_manager = True
                         st.rerun()
                     else:
                         st.error("삭제하지 못했습니다.")
@@ -773,6 +777,7 @@ def _show_history_manager():
         @dialog_decorator
         def _history_dialog():
             if st.button("닫기", key="close_history_dialog"):
+                st.session_state.show_history_manager = False
                 st.rerun()
             _render_history_manager_content()
 
@@ -780,6 +785,7 @@ def _show_history_manager():
     else:
         with st.expander("검토 기록 전체 보기", expanded=True):
             if st.button("닫기", key="close_history_panel"):
+                st.session_state.show_history_manager = False
                 st.rerun()
             _render_history_manager_content()
 
@@ -970,6 +976,7 @@ with st.sidebar:
                 st.rerun()
         if st.button("📂 리스트 전체 보기", use_container_width=True):
             open_history_manager = True
+            st.session_state.show_history_manager = True
     else:
         st.caption("아직 저장된 검토 결과가 없습니다.")
 
@@ -1451,10 +1458,7 @@ def render_grade_legend():
 
 
 # 메인 영역
-if st.session_state.get("show_history_manager"):
-    st.session_state.show_history_manager = False
-
-if open_history_manager:
+if open_history_manager or st.session_state.get("show_history_manager"):
     _show_history_manager()
 
 st.markdown(
