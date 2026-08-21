@@ -638,11 +638,7 @@ def _render_history_manager_content():
             margin: -0.25rem 0 0.85rem 0;
         }
         .history-list-item {
-            border: 1px solid #e6eaf0;
-            border-radius: 8px;
-            padding: 0.45rem 0.65rem;
-            margin: 0.5rem 0 0.25rem 0;
-            background: #ffffff;
+            padding: 0.35rem 0 0.2rem 0;
         }
         .history-list-title {
             color: #101828;
@@ -664,11 +660,18 @@ def _render_history_manager_content():
             font-size: 0.84rem;
             padding-top: 0.45rem;
         }
+        .history-list-divider {
+            border-top: 1px solid #e6eaf0;
+            margin: 0.45rem 0 0.35rem 0;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
     st.markdown(f'<div class="history-summary">전체 저장 기록 {len(records):,}개</div>', unsafe_allow_html=True)
+    delete_message = st.session_state.pop("history_delete_message", None)
+    if delete_message:
+        st.success(delete_message)
 
     search_text = st.text_input("검색", placeholder="파일명, 지식명, 강의계획서명으로 검색", key="history_search_text")
     col_period, col_sort, col_page_size = st.columns([1.2, 1, 0.8])
@@ -699,6 +702,15 @@ def _render_history_manager_content():
     filtered_records = _filter_history_records(records, search_text, period_option, start_date, end_date)
     filtered_records = _sort_history_records(filtered_records, sort_option)
 
+    def _history_select_key(history_id):
+        return f"history_select_{_safe_storage_segment(history_id, 'history')}"
+
+    selected_history_ids = [
+        record.get("history_id")
+        for record in filtered_records
+        if record.get("history_id") and st.session_state.get(_history_select_key(record.get("history_id")))
+    ]
+
     total_pages = max(1, (len(filtered_records) + page_size - 1) // page_size)
     current_page = min(st.session_state.get("history_page", 1), total_pages)
     st.session_state.history_page = current_page
@@ -720,9 +732,20 @@ def _render_history_manager_content():
             unsafe_allow_html=True,
         )
     with nav_col4:
-        st.checkbox("삭제 활성화", key="history_delete_enabled")
-
-    delete_enabled = bool(st.session_state.get("history_delete_enabled", False))
+        if st.button(f"선택 삭제 ({len(selected_history_ids)})", disabled=not selected_history_ids, key="history_delete_selected", use_container_width=True):
+            deleted_count = 0
+            failed_count = 0
+            for history_id in selected_history_ids:
+                if _delete_review_history(history_id):
+                    deleted_count += 1
+                    st.session_state[_history_select_key(history_id)] = False
+                else:
+                    failed_count += 1
+            st.session_state.history_delete_message = f"{deleted_count}개 삭제되었습니다."
+            if failed_count:
+                st.session_state.history_delete_message += f" {failed_count}개는 삭제하지 못했습니다."
+            st.session_state.show_history_manager = True
+            st.rerun()
 
     start_idx = (current_page - 1) * page_size
     page_records = filtered_records[start_idx:start_idx + page_size]
@@ -744,7 +767,9 @@ def _render_history_manager_content():
 
         with st.container():
             st.markdown('<div class="history-list-item">', unsafe_allow_html=True)
-            row_info, row_view, row_delete = st.columns([5.2, 1.35, 0.9], vertical_alignment="center")
+            row_select, row_info, row_view = st.columns([0.55, 5.2, 1.1], vertical_alignment="center")
+            with row_select:
+                st.checkbox("선택", key=_history_select_key(record["history_id"]), label_visibility="collapsed")
             with row_info:
                 st.markdown(
                     f"""
@@ -758,15 +783,8 @@ def _render_history_manager_content():
                     st.session_state.show_history_manager = False
                     _set_loaded_history(record["history_id"])
                     st.rerun()
-            with row_delete:
-                if st.button("삭제", key=f"manager_delete_{record['history_id']}", disabled=not delete_enabled, use_container_width=True):
-                    if _delete_review_history(record["history_id"]):
-                        st.success("삭제되었습니다.")
-                        st.session_state.show_history_manager = True
-                        st.rerun()
-                    else:
-                        st.error("삭제하지 못했습니다.")
             st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('<div class="history-list-divider"></div>', unsafe_allow_html=True)
 
 
 def _show_history_manager():
