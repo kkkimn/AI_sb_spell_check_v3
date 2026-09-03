@@ -41,13 +41,6 @@ st.markdown(
     [data-testid="stHeader"] {
         height: 2.5rem !important;
     }
-    [data-testid="stSidebar"] {
-        width: 31.5rem !important;
-        min-width: 31.5rem !important;
-    }
-    [data-testid="stSidebar"] > div:first-child {
-        width: 31.5rem !important;
-    }
     </style>
     """,
     unsafe_allow_html=True
@@ -519,6 +512,40 @@ def _format_history_time(value):
 
 def _parse_history_datetime(value):
     return _parse_datetime_value(value)
+
+
+def _parse_number_ranges(raw_value, max_value=None):
+    numbers = set()
+    invalid_tokens = []
+    text = (raw_value or "").strip()
+    if not text:
+        return numbers, invalid_tokens
+
+    tokens = [token.strip() for token in re.split(r"[,，\s]+", text) if token.strip()]
+    for token in tokens:
+        if "-" in token:
+            bounds = [part.strip() for part in token.split("-", 1)]
+            if len(bounds) != 2 or not bounds[0].isdigit() or not bounds[1].isdigit():
+                invalid_tokens.append(token)
+                continue
+            start_num, end_num = int(bounds[0]), int(bounds[1])
+            if start_num > end_num:
+                start_num, end_num = end_num, start_num
+            for number in range(start_num, end_num + 1):
+                if number >= 1 and (max_value is None or number <= max_value):
+                    numbers.add(number)
+                else:
+                    invalid_tokens.append(str(number))
+        elif token.isdigit():
+            number = int(token)
+            if number >= 1 and (max_value is None or number <= max_value):
+                numbers.add(number)
+            else:
+                invalid_tokens.append(token)
+        else:
+            invalid_tokens.append(token)
+
+    return numbers, invalid_tokens
 
 
 def _set_loaded_history(history_id):
@@ -1599,6 +1626,30 @@ if uploaded_file is not None:
         file_bytes = uploaded_file.read()
         hwp_text_content = core.extract_text_hwpx(file_bytes)
         doc_obj = file_bytes
+
+    max_excludable_page = None
+    page_unit_label = "페이지/슬라이드"
+    if file_ext == '.pptx' and doc_obj is not None:
+        max_excludable_page = len(doc_obj.slides)
+        page_unit_label = "슬라이드"
+    elif file_ext == '.pdf' and doc_obj is not None:
+        max_excludable_page = len(doc_obj)
+        page_unit_label = "페이지"
+
+    excluded_page_text = st.text_input(
+        "검토에서 제외할 페이지/슬라이드",
+        placeholder="예: 1, 3, 5-7",
+        help="PPTX와 PDF에서만 적용됩니다. 쉼표 또는 범위(예: 5-7)로 입력할 수 있습니다.",
+        key="excluded_page_text",
+    )
+    excluded_pages, invalid_excluded_tokens = _parse_number_ranges(excluded_page_text, max_excludable_page)
+    if max_excludable_page:
+        if excluded_pages:
+            st.caption(f"제외 대상: {', '.join(map(str, sorted(excluded_pages)))} {page_unit_label}")
+        if invalid_excluded_tokens:
+            st.warning(f"제외 번호에서 무시된 값: {', '.join(invalid_excluded_tokens)}")
+    elif excluded_page_text.strip():
+        st.warning("페이지/슬라이드 제외는 PPTX와 PDF 파일에서만 적용됩니다.")
         
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -1620,10 +1671,10 @@ if uploaded_file is not None:
             with st.spinner("문서를 스캔하고 대본을 추출하는 중..."):
                 if file_ext == '.pdf':
                     script_text = core.extract_narrations_pdf(doc_obj)
-                    full_text   = core.extract_full_text_pdf(doc_obj)
+                    full_text   = core.extract_full_text_pdf(doc_obj, excluded_pages=excluded_pages)
                 elif file_ext == '.pptx':
                     script_text = core.extract_narrations(doc_obj)
-                    full_text   = core.extract_full_text_pptx(doc_obj)
+                    full_text   = core.extract_full_text_pptx(doc_obj, excluded_slides=excluded_pages)
                 elif file_ext == '.docx':
                     script_text = {}
                     full_text   = core.extract_full_text_docx(doc_obj)
@@ -1669,7 +1720,8 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model=selected_model
+                        model=selected_model,
+                        excluded_pages=excluded_pages,
                     )
                 elif file_ext == '.pptx':
                     corrections, locations = core.get_openai_corrections_by_slide(
@@ -1678,7 +1730,8 @@ if uploaded_file is not None:
                         is_paid_tier=True,
                         custom_dict=custom_dict_list,
                         progress_callback=update_progress,
-                        model=selected_model
+                        model=selected_model,
+                        excluded_slides=excluded_pages,
                     )
                 elif file_ext == '.docx':
                     corrections, locations = core.get_openai_corrections_docx(
@@ -1729,6 +1782,7 @@ if uploaded_file is not None:
                         file_ext,
                         doc_obj=doc_obj,
                         full_text=st.session_state.full_text or "",
+                        excluded_pages=excluded_pages,
                     )
                     progress_bar_rev = st.progress(0)
                     status_text_rev = st.empty()
@@ -2077,14 +2131,14 @@ if uploaded_file is not None:
             with st.spinner("수정 및 덧그리기 작업 중입니다..."):
                 out_stream = io.BytesIO()
                 if file_ext == '.pdf':
-                    core.apply_corrections_to_pdf(doc_obj, st.session_state.corrections)
+                    core.apply_corrections_to_pdf(doc_obj, st.session_state.corrections, excluded_pages=excluded_pages)
                     doc_obj.save(out_stream)
                     doc_obj.close()
                     mime_type = "application/pdf"
                     btn_label = "💖 교정 하이라이트 PDF 다운로드"
                     download_name = f"완료_{uploaded_file.name}"
                 elif file_ext == '.pptx':
-                    core.apply_corrections_to_ppt(doc_obj, st.session_state.corrections)
+                    core.apply_corrections_to_ppt(doc_obj, st.session_state.corrections, excluded_slides=excluded_pages)
                     doc_obj.save(out_stream)
                     mime_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                     btn_label = "💖 핑크색 교정 반영본 PPTX 다운로드"
@@ -2146,6 +2200,8 @@ if uploaded_file is not None:
             "alignment_report": st.session_state.get("alignment_report"),
             "content_reviews": st.session_state.get("content_reviews") or [],
             "content_review_context": st.session_state.get("content_review_context"),
+            "excluded_pages": sorted(excluded_pages),
+            "excluded_page_unit": page_unit_label if max_excludable_page else "",
             "excel_name": f"교정결과_{uploaded_file.name}.xlsx",
             "completed_name": download_name,
             "completed_mime": mime_type,

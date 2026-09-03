@@ -888,12 +888,13 @@ def _has_natural_start(text, word):
 # OpenAI 교정 (PPT)
 # ==========================================
 def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict=None,
-                                    progress_callback=None, model="gpt-5.6-sol"):
+                                    progress_callback=None, model="gpt-5.6-sol", excluded_slides=None):
     """
     슬라이드들을 배치 단위로 묶어서 OpenAI 교정안을 확보합니다.
     """
     client = OpenAI(api_key=api_key)
     global_corrections = {}
+    excluded_slides = set(excluded_slides or [])
     
     system_prompt = _build_system_prompt(custom_dict, doc_kind="파워포인트 슬라이드")
     total_slides = len(prs.slides)
@@ -901,6 +902,10 @@ def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict
     # 1. 각 슬라이드의 텍스트 추출 및 캐싱
     slide_contents = []
     for i, slide in enumerate(prs.slides):
+        slide_num = i + 1
+        if slide_num in excluded_slides:
+            slide_contents.append("")
+            continue
         slide_texts = []
         for shape in iter_shapes(slide.shapes):
             t = _safe_shape_text(shape).strip()
@@ -1003,7 +1008,7 @@ def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict
             progress_callback(slide_nums[-1], total_slides)
             
     # 빈 슬라이드가 많아 아예 배치가 없는 경우 프로그레스 백업 호출
-    if not batches and progress_callback:
+    if progress_callback:
         progress_callback(total_slides, total_slides)
 
     # 4. 로컬 위치 매핑
@@ -1019,12 +1024,15 @@ def get_openai_corrections_by_slide(prs, api_key, is_paid_tier=True, custom_dict
 # ==========================================
 # 교정 적용 (PPT)
 # ==========================================
-def apply_corrections_to_ppt(prs, corrections_dict):
+def apply_corrections_to_ppt(prs, corrections_dict, excluded_slides=None):
     """
     교정 딕셔너리를 PPT 내부 텍스트에 적용하고, 변경된 부분을 핫핑크색으로 강조한다.
     그룹 도형까지 재귀적으로 처리한다.
     """
-    for slide in prs.slides:
+    excluded_slides = set(excluded_slides or [])
+    for slide_idx, slide in enumerate(prs.slides, 1):
+        if slide_idx in excluded_slides:
+            continue
         for shape in iter_shapes(slide.shapes):
             if shape.has_text_frame:
                 for paragraph in shape.text_frame.paragraphs:
@@ -1149,12 +1157,13 @@ def extract_narrations_pdf(pdf_document):
 
 
 def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True, custom_dict=None,
-                                       progress_callback=None, model="gpt-5.6-sol"):
+                                       progress_callback=None, model="gpt-5.6-sol", excluded_pages=None):
     """
     PDF 페이지들을 배치 단위로 묶어서 OpenAI 교정안을 확보합니다.
     """
     client = OpenAI(api_key=api_key)
     global_corrections = {}
+    excluded_pages = set(excluded_pages or [])
     
     system_prompt = _build_system_prompt(custom_dict, doc_kind="PDF 문서")
     total_pages = len(pdf_document)
@@ -1162,6 +1171,10 @@ def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True,
     # 1. 각 페이지의 텍스트 추출 및 캐싱
     page_contents = []
     for i in range(total_pages):
+        page_num = i + 1
+        if page_num in excluded_pages:
+            page_contents.append("")
+            continue
         page = pdf_document[i]
         blocks = page.get_text("blocks")
         text_lines = []
@@ -1256,7 +1269,7 @@ def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True,
             progress_callback(page_nums[-1], total_pages)
             
     # 빈 페이지가 많아 아예 배치가 없는 경우 프로그레스 백업 호출
-    if not batches and progress_callback:
+    if progress_callback:
         progress_callback(total_pages, total_pages)
 
     # 4. 로컬 위치 매핑
@@ -1269,14 +1282,17 @@ def get_openai_corrections_by_page_pdf(pdf_document, api_key, is_paid_tier=True,
                 locations[k_str].append(page_num)
                 
     return global_corrections, locations
-def apply_corrections_to_pdf(pdf_document, corrections_dict):
+def apply_corrections_to_pdf(pdf_document, corrections_dict, excluded_pages=None):
     """
     교정 딕셔너리를 바탕으로 PDF 원문에 핫핑크색 하이라이트 어노테이션을 그린다.
     긴 키부터 처리해서 짧은 키가 긴 키 안에 중복 매칭되는 것을 방지.
     """
     sorted_items = _sorted_corrections(corrections_dict)
+    excluded_pages = set(excluded_pages or [])
     
-    for page in pdf_document:
+    for page_idx, page in enumerate(pdf_document, 1):
+        if page_idx in excluded_pages:
+            continue
         for old_txt, new_txt in sorted_items:
             if not old_txt.strip(): continue
             
@@ -1358,10 +1374,13 @@ def classify_error(old_txt, new_txt):
     return 'spelling'
 
 
-def extract_full_text_pptx(prs):
+def extract_full_text_pptx(prs, excluded_slides=None):
     """PPT 전체 텍스트 추출 (점수 계산용 어절 수 산출)."""
     parts = []
-    for slide in prs.slides:
+    excluded_slides = set(excluded_slides or [])
+    for slide_idx, slide in enumerate(prs.slides, 1):
+        if slide_idx in excluded_slides:
+            continue
         for shape in iter_shapes(slide.shapes):
             t = _safe_shape_text(shape).strip()
             if t:
@@ -1379,10 +1398,13 @@ def extract_full_text_pptx(prs):
     return ' '.join(parts)
 
 
-def extract_full_text_pdf(pdf_document):
+def extract_full_text_pdf(pdf_document, excluded_pages=None):
     """PDF 전체 텍스트 추출 (점수 계산용 어절 수 산출)."""
     parts = []
-    for page in pdf_document:
+    excluded_pages = set(excluded_pages or [])
+    for page_idx, page in enumerate(pdf_document, 1):
+        if page_idx in excluded_pages:
+            continue
         blocks = page.get_text("blocks")
         for b in blocks:
             if len(b) >= 5:
@@ -1734,12 +1756,15 @@ def analyze_document_against_reference(
     return result
 
 
-def build_document_content_sections(file_ext, doc_obj=None, full_text="", chunk_size=20):
+def build_document_content_sections(file_ext, doc_obj=None, full_text="", chunk_size=20, excluded_pages=None):
     """문서 형식별로 위치 정보가 포함된 내용 검토 구간을 만든다."""
     sections = []
+    excluded_pages = set(excluded_pages or [])
 
     if file_ext == ".pptx" and doc_obj is not None:
         for idx, slide in enumerate(doc_obj.slides, 1):
+            if idx in excluded_pages:
+                continue
             parts = []
             for shape in iter_shapes(slide.shapes):
                 text = _safe_shape_text(shape).strip()
@@ -1762,6 +1787,8 @@ def build_document_content_sections(file_ext, doc_obj=None, full_text="", chunk_
 
     if file_ext == ".pdf" and doc_obj is not None:
         for idx, page in enumerate(doc_obj, 1):
+            if idx in excluded_pages:
+                continue
             page_text = page.get_text("text").strip()
             if page_text:
                 sections.append({"location": f"{idx} 페이지", "text": page_text})
